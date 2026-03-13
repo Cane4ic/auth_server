@@ -1,0 +1,12 @@
+eel==0.16.0
+pyinstaller==6.4.0
+pywebview
+requests
+transformers
+torch
+sentencepiece
+fastapi
+uvicorn
+aiogram
+supabase
+pydantic
