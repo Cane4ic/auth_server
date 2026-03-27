@@ -3,6 +3,7 @@
 API для приложения + админ-панель в Telegram (только ADMIN_ID).
 """
 import asyncio
+import html
 import os
 import re
 import time
@@ -101,6 +102,11 @@ async def send_auth_log(title: str, lines: list[str]) -> None:
         print(f"AUTH_LOG send failed: {e}")
 
 
+def esc_html(s: str) -> str:
+    """Экранирование для Telegram HTML (username с _, HWID и т.д.)."""
+    return html.escape(str(s), quote=False)
+
+
 def fmt_ts(ts: Optional[int]) -> str:
     if not ts:
         return "—"
@@ -127,13 +133,14 @@ def build_user_card_text(tid: int, u: dict) -> str:
     sub = u.get("subscription_until") or 0
     status = "активна ✅" if sub >= now else "истекла ⛔"
     hw = u.get("hwid")
-    hw_show = f"`{hw}`" if hw else "_не привязан_"
+    hw_show = f"<code>{esc_html(hw)}</code>" if hw else "<i>не привязан</i>"
+    un = esc_html(u.get("username") or "—")
     return (
-        f"👤 **Пользователь**\n\n"
-        f"• ID: `{tid}`\n"
-        f"• Username: {u.get('username') or '—'}\n"
-        f"• Подписка: **{status}**\n"
-        f"• До (UTC): {fmt_ts(sub)}\n"
+        f"👤 <b>Пользователь</b>\n\n"
+        f"• ID: <code>{tid}</code>\n"
+        f"• Username: {un}\n"
+        f"• Подписка: <b>{esc_html(status)}</b>\n"
+        f"• До (UTC): {esc_html(fmt_ts(sub))}\n"
         f"• HWID:\n{hw_show}\n"
     )
 
@@ -147,7 +154,7 @@ async def edit_user_card(query: CallbackQuery, tid: int, answer_popup: Optional[
     text = build_user_card_text(tid, u)
     await query.message.edit_text(
         text,
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=kb_user_actions(tid),
     )
     await query.answer(answer_popup or "")
@@ -260,7 +267,7 @@ def build_user_profile_public_text(tid: int, u: Optional[dict]) -> str:
     """Профиль для обычного пользователя (без HWID)."""
     if not u:
         return (
-            "👤 **Профиль**\n\n"
+            "👤 <b>Профиль</b>\n\n"
             "Запись в базе не найдена. После покупки подписки данные появятся здесь.\n\n"
             "Используйте «Купить подписку», если ещё не оформляли доступ."
         )
@@ -269,10 +276,10 @@ def build_user_profile_public_text(tid: int, u: Optional[dict]) -> str:
     active = sub >= now
     status = "активна ✅" if active else "истекла ⛔"
     return (
-        "👤 **Профиль**\n\n"
-        f"• Telegram ID: `{tid}`\n"
-        f"• Подписка: **{status}**\n"
-        f"• До (UTC): {fmt_ts(sub)}\n"
+        "👤 <b>Профиль</b>\n\n"
+        f"• Telegram ID: <code>{tid}</code>\n"
+        f"• Подписка: <b>{esc_html(status)}</b>\n"
+        f"• До (UTC): {esc_html(fmt_ts(sub))}\n"
     )
 
 
@@ -586,7 +593,7 @@ async def cb_user_profile_menu(query: CallbackQuery):
     u = user_get(tid)
     await query.message.edit_text(
         build_user_profile_public_text(tid, u),
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=kb_user_back_main(),
     )
     await query.answer()
@@ -723,7 +730,7 @@ async def cb_list(query: CallbackQuery, state: FSMContext):
     start = page * PAGE_SIZE
     chunk = users[start : start + PAGE_SIZE]
 
-    lines = [f"📋 **Пользователи** (всего: {total})\n"]
+    lines = [f"📋 <b>Пользователи</b> (всего: {total})\n"]
     rows = []
     now = int(time.time())
     for u in chunk:
@@ -732,7 +739,10 @@ async def cb_list(query: CallbackQuery, state: FSMContext):
         sub = u.get("subscription_until") or 0
         active = "✅" if sub >= now else "⛔"
         short_hw = "есть" if u.get("hwid") else "нет"
-        lines.append(f"{active} `{tid}` {un}\n   до: {fmt_ts(sub)} · HWID: {short_hw}\n")
+        lines.append(
+            f"{active} <code>{tid}</code> {esc_html(un)}\n"
+            f"   до: {esc_html(fmt_ts(sub))} · HWID: {short_hw}\n"
+        )
         rows.append(
             [InlineKeyboardButton(text=f"✏️ {tid}", callback_data=f"{CB}:u:{tid}")]
         )
@@ -742,7 +752,7 @@ async def cb_list(query: CallbackQuery, state: FSMContext):
     if rows:
         markup.inline_keyboard = rows + markup.inline_keyboard
 
-    await query.message.edit_text(text, parse_mode="Markdown", reply_markup=markup)
+    await query.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
     await query.answer()
 
 
