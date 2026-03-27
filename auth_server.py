@@ -11,12 +11,14 @@ from typing import Optional
 
 import uvicorn
 from aiogram import Bot, Dispatcher, F
+from aiogram.enums import ChatMemberStatus
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import Client, create_client
 
@@ -32,12 +34,30 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 if not all([BOT_TOKEN, ADMIN_ID, SUPABASE_URL, SUPABASE_KEY]):
     print("ВНИМАНИЕ: Не все переменные окружения заданы (BOT_TOKEN, ADMIN_ID, SUPABASE_*)!")
 
-# Короткий префикс callback — лимит Telegram 64 байта
+# Канал для обычного /start (авторизация по deep-link /start SESSION не затрагивается)
+REQUIRED_CHANNEL_ID = (os.environ.get("REQUIRED_CHANNEL_ID") or "").strip()
+CHANNEL_INVITE_LINK = (os.environ.get("CHANNEL_INVITE_LINK") or "").strip()
+# Внешние ссылки для кнопок меню (опционально)
+LINK_REVIEWS = (os.environ.get("LINK_REVIEWS") or "").strip()
+LINK_BUY = (os.environ.get("LINK_BUY") or "").strip()
+LINK_SUPPORT = (os.environ.get("LINK_SUPPORT") or "").strip()
+
+# Короткий префикс callback — лимит Telegram 64 байта (a: админ, u: пользователь)
 CB = "a"
+UCB = "u"
 
 PAGE_SIZE = 7
 
 app = FastAPI()
+_raw_cors = (os.environ.get("CORS_ORIGINS") or "*").strip()
+_cors_list = ["*"] if _raw_cors == "*" else [o.strip() for o in _raw_cors.split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_list,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
@@ -141,6 +161,99 @@ def kb_user_actions(tid: int):
     )
 
 
+async def user_passes_channel_gate(user_id: int) -> bool:
+    """Подписка на канал не требуется, если REQUIRED_CHANNEL_ID пустой."""
+    if not REQUIRED_CHANNEL_ID:
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL_ID, user_id=user_id)
+        st = member.status
+        if st in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def kb_channel_required():
+    """Экран «сначала подпишитесь»."""
+    rows = []
+    if CHANNEL_INVITE_LINK:
+        rows.append(
+            [InlineKeyboardButton(text="📢 Подписаться на канал", url=CHANNEL_INVITE_LINK)]
+        )
+    rows.append(
+        [InlineKeyboardButton(text="✅ Я подписался, проверить", callback_data=f"{UCB}:chk")]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_user_main_menu():
+    """Главное меню пользователя."""
+    row_rev = []
+    if LINK_REVIEWS:
+        row_rev = [InlineKeyboardButton(text="⭐ Отзывы", url=LINK_REVIEWS)]
+    else:
+        row_rev = [InlineKeyboardButton(text="⭐ Отзывы", callback_data=f"{UCB}:reviews")]
+
+    row_buy = []
+    if LINK_BUY:
+        row_buy = [InlineKeyboardButton(text="💳 Купить подписку", url=LINK_BUY)]
+    else:
+        row_buy = [InlineKeyboardButton(text="💳 Купить подписку", callback_data=f"{UCB}:buy")]
+
+    row_sup = []
+    if LINK_SUPPORT:
+        row_sup = [InlineKeyboardButton(text="💬 Поддержка", url=LINK_SUPPORT)]
+    else:
+        row_sup = [InlineKeyboardButton(text="💬 Поддержка", callback_data=f"{UCB}:support")]
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="👤 Профиль", callback_data=f"{UCB}:profile")],
+            row_rev,
+            row_buy,
+            row_sup,
+        ]
+    )
+
+
+def kb_user_back_main():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Главное меню", callback_data=f"{UCB}:main")],
+        ]
+    )
+
+
+def text_user_main_menu() -> str:
+    return (
+        "🏠 **Neuro Uploader**\n\n"
+        "Выберите раздел ниже.\n\n"
+        "Авторизация в приложении — через кнопку входа в программе (это отдельный сценарий)."
+    )
+
+
+def build_user_profile_public_text(tid: int, u: Optional[dict]) -> str:
+    """Профиль для обычного пользователя (без HWID)."""
+    if not u:
+        return (
+            "👤 **Профиль**\n\n"
+            "Запись в базе не найдена. После покупки подписки данные появятся здесь.\n\n"
+            "Используйте «Купить подписку», если ещё не оформляли доступ."
+        )
+    now = int(time.time())
+    sub = u.get("subscription_until") or 0
+    active = sub >= now
+    status = "активна ✅" if active else "истекла ⛔"
+    return (
+        "👤 **Профиль**\n\n"
+        f"• Telegram ID: `{tid}`\n"
+        f"• Подписка: **{status}**\n"
+        f"• До (UTC): {fmt_ts(sub)}\n"
+    )
+
+
 def kb_list_nav(page: int, total_pages: int):
     row = []
     if page > 0:
@@ -154,6 +267,46 @@ def kb_list_nav(page: int, total_pages: int):
             [InlineKeyboardButton(text="🏠 Админ-меню", callback_data=f"{CB}:menu")],
         ]
     )
+
+
+def kb_web_login_confirm(session_id: str):
+    """Кнопка подтверждения входа на сайт (callback ≤ 64 байт: u:auth:<uuid>)."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Авторизоваться на сайте",
+                    callback_data=f"{UCB}:auth:{session_id}",
+                )
+            ]
+        ]
+    )
+
+
+def complete_web_site_login_sync(session_id: str, telegram_id: int, username: str) -> Optional[str]:
+    """None = успех, иначе текст ошибки для пользователя."""
+    session_res = (
+        supabase.table("auth_sessions")
+        .select("*")
+        .eq("session_id", session_id)
+        .eq("status", "pending")
+        .execute()
+    )
+    if not session_res.data:
+        return "Сессия не найдена или уже использована."
+    session = session_res.data[0]
+    if not str(session.get("hwid") or "").startswith("WEB_BROWSER_"):
+        return "Неверный тип сессии."
+    user_res = supabase.table("users").select("*").eq("telegram_id", telegram_id).execute()
+    current_time = int(time.time())
+    if not user_res.data or user_res.data[0]["subscription_until"] < current_time:
+        supabase.table("auth_sessions").update({"status": "failed"}).eq("session_id", session_id).execute()
+        return "У вас нет активной подписки."
+    supabase.table("users").update({"username": username}).eq("telegram_id", telegram_id).execute()
+    supabase.table("auth_sessions").update({"status": "success", "telegram_id": telegram_id}).eq(
+        "session_id", session_id
+    ).execute()
+    return None
 
 
 # --- FastAPI (без изменений по смыслу) ---
@@ -179,7 +332,13 @@ async def check_auth(session_id: str):
     if not response.data:
         raise HTTPException(status_code=404, detail="Session not found")
     session = response.data[0]
-    return {"status": session["status"], "telegram_id": session.get("telegram_id")}
+    tid = session.get("telegram_id")
+    username = None
+    if session.get("status") == "success" and tid:
+        ur = supabase.table("users").select("username").eq("telegram_id", tid).execute()
+        if ur.data:
+            username = ur.data[0].get("username")
+    return {"status": session["status"], "telegram_id": tid, "username": username}
 
 
 @app.get("/api/auth/verify/{telegram_id}")
@@ -198,14 +357,24 @@ async def verify_subscription(telegram_id: int):
 async def cmd_start(message: Message):
     args = message.text.split() if message.text else []
     if len(args) == 1:
+        uid = message.from_user.id
+        # Обычный /start: опционально проверка канала (не для /start с параметром авторизации)
+        if not is_admin(uid) and not await user_passes_channel_gate(uid):
+            await message.answer(
+                "📢 Чтобы пользоваться ботом, подпишитесь на наш канал.\n\n"
+                "После подписки нажмите **«Я подписался, проверить»**.",
+                parse_mode="Markdown",
+                reply_markup=kb_channel_required(),
+            )
+            return
+
         extra = ""
-        if is_admin(message.from_user.id):
+        if is_admin(uid):
             extra = "\n\n🔐 /admin — панель администратора."
         await message.answer(
-            "👋 Привет! Я бот **Neuro Uploader**.\n\n"
-            "Авторизация в приложении и на сайте — по кнопке входа в интерфейсе."
-            + extra,
+            text_user_main_menu() + extra,
             parse_mode="Markdown",
+            reply_markup=kb_user_main_menu(),
         )
         return
 
@@ -239,11 +408,12 @@ async def cmd_start(message: Message):
     user = user_res.data[0]
 
     if is_web_login:
-        supabase.table("users").update({"username": username}).eq("telegram_id", telegram_id).execute()
-        supabase.table("auth_sessions").update({"status": "success", "telegram_id": telegram_id}).eq(
-            "session_id", session_id
-        ).execute()
-        await message.answer("✅ Вход на сайт выполнен успешно!")
+        await message.answer(
+            "🔐 **Вход на сайт Neuro Uploader**\n\n"
+            "Нажмите кнопку ниже, чтобы подтвердить вход.",
+            parse_mode="Markdown",
+            reply_markup=kb_web_login_confirm(session_id),
+        )
         return
 
     saved_hwid = user.get("hwid")
@@ -264,6 +434,109 @@ async def cmd_start(message: Message):
     else:
         supabase.table("auth_sessions").update({"status": "failed"}).eq("session_id", session_id).execute()
         await message.answer("❌ Ошибка! Подписка уже используется на другом ПК.")
+
+
+@dp.callback_query(F.data.startswith(f"{UCB}:auth:"))
+async def cb_web_login_confirm(query: CallbackQuery):
+    parts = query.data.split(":", 2)
+    if len(parts) < 3:
+        await query.answer("Ошибка данных", show_alert=True)
+        return
+    session_id = parts[2]
+    tid = query.from_user.id
+    username = f"@{query.from_user.username}" if query.from_user.username else str(tid)
+    err = complete_web_site_login_sync(session_id, tid, username)
+    if err:
+        await query.answer(err, show_alert=True)
+        return
+    await query.message.edit_text("✅ Вход на сайт выполнен успешно!")
+    await query.answer()
+
+
+# --- Пользователь: главное меню (не затрагивает авторизацию в приложении по deep-link) ---
+
+
+@dp.callback_query(F.data == f"{UCB}:chk")
+async def cb_user_channel_recheck(query: CallbackQuery):
+    """Повторная проверка подписки на канал."""
+    uid = query.from_user.id
+    if await user_passes_channel_gate(uid):
+        extra = "\n\n🔐 /admin — панель администратора." if is_admin(uid) else ""
+        await query.message.edit_text(
+            text_user_main_menu() + extra,
+            parse_mode="Markdown",
+            reply_markup=kb_user_main_menu(),
+        )
+        await query.answer("✅ Подписка подтверждена!")
+    else:
+        await query.answer("Сначала подпишитесь на канал.", show_alert=True)
+
+
+@dp.callback_query(F.data == f"{UCB}:main")
+async def cb_user_back_main(query: CallbackQuery):
+    extra = "\n\n🔐 /admin — панель администратора." if is_admin(query.from_user.id) else ""
+    await query.message.edit_text(
+        text_user_main_menu() + extra,
+        parse_mode="Markdown",
+        reply_markup=kb_user_main_menu(),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == f"{UCB}:profile")
+async def cb_user_profile_menu(query: CallbackQuery):
+    tid = query.from_user.id
+    u = user_get(tid)
+    await query.message.edit_text(
+        build_user_profile_public_text(tid, u),
+        parse_mode="Markdown",
+        reply_markup=kb_user_back_main(),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == f"{UCB}:reviews")
+async def cb_user_reviews_placeholder(query: CallbackQuery):
+    text = os.environ.get(
+        "TEXT_REVIEWS",
+        "⭐ **Отзывы**\n\nЗдесь будет ссылка на отзывы или канал. Укажите `LINK_REVIEWS` в настройках.",
+    )
+    await query.message.edit_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=kb_user_back_main(),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == f"{UCB}:buy")
+async def cb_user_buy_placeholder(query: CallbackQuery):
+    text = os.environ.get(
+        "TEXT_BUY",
+        "💳 **Купить подписку**\n\nНапишите в поддержку или перейдите по ссылке из канала. "
+        "Задайте переменную `LINK_BUY` для кнопки с оплатой.",
+    )
+    await query.message.edit_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=kb_user_back_main(),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == f"{UCB}:support")
+async def cb_user_support_placeholder(query: CallbackQuery):
+    text = os.environ.get(
+        "TEXT_SUPPORT",
+        "💬 **Поддержка**\n\nОпишите проблему в ответе на это сообщение или задайте `LINK_SUPPORT` "
+        "(например ссылка на чат с менеджером).",
+    )
+    await query.message.edit_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=kb_user_back_main(),
+    )
+    await query.answer()
 
 
 # --- Админ: команды ---
