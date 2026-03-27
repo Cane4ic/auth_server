@@ -50,7 +50,12 @@ PAGE_SIZE = 7
 
 app = FastAPI()
 _raw_cors = (os.environ.get("CORS_ORIGINS") or "*").strip()
-_cors_list = ["*"] if _raw_cors == "*" else [o.strip() for o in _raw_cors.split(",") if o.strip()]
+if not _raw_cors or _raw_cors == "*":
+    _cors_list = ["*"]
+else:
+    _cors_list = [o.strip() for o in _raw_cors.split(",") if o.strip()]
+    if not _cors_list:
+        _cors_list = ["*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_list,
@@ -312,17 +317,42 @@ def complete_web_site_login_sync(session_id: str, telegram_id: int, username: st
 # --- FastAPI (без изменений по смыслу) ---
 
 
+@app.get("/")
+async def root():
+    return {"service": "neuro-uploader-auth", "docs": "/docs", "health": "/health", "ping": "/api/auth/ping"}
+
+
+@app.get("/health")
+async def health():
+    """Проверка, что сервис поднят (удобно для Railway / браузера)."""
+    return {"ok": True}
+
+
+@app.get("/api/auth/ping")
+async def auth_ping():
+    """Проверка из браузера: откройте URL в новой вкладке или fetch с localhost."""
+    return {"ok": True}
+
+
 @app.post("/api/auth/start")
 async def start_auth(req: AuthRequest):
-    bot_info = await bot.get_me()
-    supabase.table("auth_sessions").upsert(
-        {
-            "session_id": req.session_id,
-            "hwid": req.hwid,
-            "status": "pending",
-            "created_at": int(time.time()),
-        }
-    ).execute()
+    if not bot:
+        raise HTTPException(status_code=503, detail="BOT_TOKEN не задан — бот не сконфигурирован")
+    try:
+        bot_info = await bot.get_me()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Telegram API недоступен: {e!s}") from e
+    try:
+        supabase.table("auth_sessions").upsert(
+            {
+                "session_id": req.session_id,
+                "hwid": req.hwid,
+                "status": "pending",
+                "created_at": int(time.time()),
+            }
+        ).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Supabase (auth_sessions): {e!s}") from e
     return {"status": "ok", "login_url": f"https://t.me/{bot_info.username}?start={req.session_id}"}
 
 
