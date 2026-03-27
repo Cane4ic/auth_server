@@ -41,6 +41,8 @@ CHANNEL_INVITE_LINK = (os.environ.get("CHANNEL_INVITE_LINK") or "").strip()
 LINK_REVIEWS = (os.environ.get("LINK_REVIEWS") or "").strip()
 LINK_BUY = (os.environ.get("LINK_BUY") or "").strip()
 LINK_SUPPORT = (os.environ.get("LINK_SUPPORT") or "").strip()
+# Чат для логов входа на сайт / в приложение (числовой id: группа или канал; бот должен быть участником)
+AUTH_LOG_CHAT_ID = (os.environ.get("AUTH_LOG_CHAT_ID") or "").strip()
 
 # Короткий префикс callback — лимит Telegram 64 байта (a: админ, u: пользователь)
 CB = "a"
@@ -82,6 +84,21 @@ class AdminStates(StatesGroup):
 
 def is_admin(user_id: int) -> bool:
     return bool(ADMIN_ID) and user_id == ADMIN_ID
+
+
+async def send_auth_log(title: str, lines: list[str]) -> None:
+    """Отправка в отдельный чат (AUTH_LOG_CHAT_ID). Не ломает авторизацию при ошибке."""
+    if not AUTH_LOG_CHAT_ID or not bot:
+        return
+    try:
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        body = "\n".join(f"• {x}" for x in lines)
+        text = f"{title}\n{body}\n• Время: {ts}"
+        if len(text) > 4000:
+            text = text[:3997] + "..."
+        await bot.send_message(chat_id=int(AUTH_LOG_CHAT_ID), text=text)
+    except Exception as e:
+        print(f"AUTH_LOG send failed: {e}")
 
 
 def fmt_ts(ts: Optional[int]) -> str:
@@ -288,8 +305,11 @@ def kb_web_login_confirm(session_id: str):
     )
 
 
-def complete_web_site_login_sync(session_id: str, telegram_id: int, username: str) -> Optional[str]:
-    """None = успех, иначе текст ошибки для пользователя."""
+def complete_web_site_login_sync(session_id: str, telegram_id: int, username: str) -> tuple[Optional[str], bool]:
+    """Вход на сайт: в БД только telegram_id и @username, HWID не трогаем (привязка ПК — только из приложения).
+
+    Возвращает (ошибка или None, is_new_user).
+    """
     session_res = (
         supabase.table("auth_sessions")
         .select("*")
@@ -298,20 +318,25 @@ def complete_web_site_login_sync(session_id: str, telegram_id: int, username: st
         .execute()
     )
     if not session_res.data:
-        return "Сессия не найдена или уже использована."
+        return "Сессия не найдена или уже использована.", False
     session = session_res.data[0]
     if not str(session.get("hwid") or "").startswith("WEB_BROWSER_"):
-        return "Неверный тип сессии."
+        return "Неверный тип сессии.", False
     user_res = supabase.table("users").select("*").eq("telegram_id", telegram_id).execute()
-    current_time = int(time.time())
-    if not user_res.data or user_res.data[0]["subscription_until"] < current_time:
-        supabase.table("auth_sessions").update({"status": "failed"}).eq("session_id", session_id).execute()
-        return "У вас нет активной подписки."
-    supabase.table("users").update({"username": username}).eq("telegram_id", telegram_id).execute()
+    is_new = False
+    if not user_res.data:
+        supabase.table("users").insert(
+            {"telegram_id": telegram_id, "username": username, "hwid": None, "subscription_until": 0}
+        ).execute()
+        is_new = True
+    else:
+        # Только username; hwid не перезаписываем — он задаётся при первом входе в приложение
+        supabase.table("users").update({"username": username}).eq("telegram_id", telegram_id).execute()
+        is_new = False
     supabase.table("auth_sessions").update({"status": "success", "telegram_id": telegram_id}).eq(
         "session_id", session_id
     ).execute()
-    return None
+    return None, is_new
 
 
 # --- FastAPI (без изменений по смыслу) ---
@@ -421,22 +446,17 @@ async def cmd_start(message: Message):
     )
     if not session_res.data:
         await message.answer("❌ Ссылка недействительна.")
+        await send_auth_log(
+            "⚠️ Авторизация",
+            ["Сбой: недействительная ссылка сессии", f"ID: `{telegram_id}`", f"Username: {username}"],
+        )
         return
 
     session = session_res.data[0]
     hwid_from_app = session["hwid"]
     is_web_login = hwid_from_app.startswith("WEB_BROWSER_")
 
-    user_res = supabase.table("users").select("*").eq("telegram_id", telegram_id).execute()
-    current_time = int(time.time())
-
-    if not user_res.data or user_res.data[0]["subscription_until"] < current_time:
-        supabase.table("auth_sessions").update({"status": "failed"}).eq("session_id", session_id).execute()
-        await message.answer("❌ У вас нет активной подписки.")
-        return
-
-    user = user_res.data[0]
-
+    # Вход на сайт — без проверки подписки; десктоп — только с активной подпиской
     if is_web_login:
         await message.answer(
             "🔐 **Вход на сайт Neuro Uploader**\n\n"
@@ -445,6 +465,20 @@ async def cmd_start(message: Message):
             reply_markup=kb_web_login_confirm(session_id),
         )
         return
+
+    user_res = supabase.table("users").select("*").eq("telegram_id", telegram_id).execute()
+    current_time = int(time.time())
+
+    if not user_res.data or user_res.data[0]["subscription_until"] < current_time:
+        supabase.table("auth_sessions").update({"status": "failed"}).eq("session_id", session_id).execute()
+        await message.answer("❌ У вас нет активной подписки.")
+        await send_auth_log(
+            "⚠️ Вход в приложение отклонён",
+            [f"Причина: нет активной подписки", f"ID: `{telegram_id}`", f"Username: {username}"],
+        )
+        return
+
+    user = user_res.data[0]
 
     saved_hwid = user.get("hwid")
     if not saved_hwid:
@@ -455,15 +489,39 @@ async def cmd_start(message: Message):
             "session_id", session_id
         ).execute()
         await message.answer("✅ Успешный вход! Аккаунт привязан к этому ПК.")
+        await send_auth_log(
+            "💻 Вход в приложение",
+            [
+                f"ID: `{telegram_id}`",
+                f"Username: {username}",
+                "HWID: записан впервые (привязка к ПК)",
+            ],
+        )
     elif saved_hwid == hwid_from_app:
         supabase.table("users").update({"username": username}).eq("telegram_id", telegram_id).execute()
         supabase.table("auth_sessions").update({"status": "success", "telegram_id": telegram_id}).eq(
             "session_id", session_id
         ).execute()
         await message.answer("✅ Успешный вход! Возвращайтесь в программу.")
+        await send_auth_log(
+            "💻 Вход в приложение",
+            [
+                f"ID: `{telegram_id}`",
+                f"Username: {username}",
+                "HWID: совпадает с сохранённым",
+            ],
+        )
     else:
         supabase.table("auth_sessions").update({"status": "failed"}).eq("session_id", session_id).execute()
         await message.answer("❌ Ошибка! Подписка уже используется на другом ПК.")
+        await send_auth_log(
+            "⚠️ Вход в приложение отклонён",
+            [
+                f"Причина: другой ПК уже привязан",
+                f"ID: `{telegram_id}`",
+                f"Username: {username}",
+            ],
+        )
 
 
 @dp.callback_query(F.data.startswith(f"{UCB}:auth:"))
@@ -475,10 +533,19 @@ async def cb_web_login_confirm(query: CallbackQuery):
     session_id = parts[2]
     tid = query.from_user.id
     username = f"@{query.from_user.username}" if query.from_user.username else str(tid)
-    err = complete_web_site_login_sync(session_id, tid, username)
+    err, is_new = complete_web_site_login_sync(session_id, tid, username)
     if err:
         await query.answer(err, show_alert=True)
         return
+    await send_auth_log(
+        "🌐 Вход на сайт",
+        [
+            f"ID: `{tid}`",
+            f"Username: {username}",
+            "Регистрация в БД" if is_new else "Пользователь уже был в БД (обновлён username)",
+            "HWID не менялся (только сайт)",
+        ],
+    )
     await query.message.edit_text("✅ Вход на сайт выполнен успешно!")
     await query.answer()
 
