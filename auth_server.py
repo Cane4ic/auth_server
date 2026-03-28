@@ -87,6 +87,17 @@ def is_admin(user_id: int) -> bool:
     return bool(ADMIN_ID) and user_id == ADMIN_ID
 
 
+# kind для сайта: app_success_first_pc | app_success_same_pc | app_fail_no_subscription | app_fail_other_pc | app_fail_invalid_link
+def save_login_notification(telegram_id: int, kind: str, success: bool) -> None:
+    """События входа в приложение для раздела «Уведомления» на сайте (таблица login_notifications)."""
+    try:
+        supabase.table("login_notifications").insert(
+            {"telegram_id": telegram_id, "kind": kind, "success": success, "created_at": int(time.time())}
+        ).execute()
+    except Exception as e:
+        print(f"login_notifications insert failed: {e}")
+
+
 async def send_auth_log(title: str, lines: list[str]) -> None:
     """Отправка в отдельный чат (AUTH_LOG_CHAT_ID). Не ломает авторизацию при ошибке."""
     if not AUTH_LOG_CHAT_ID or not bot:
@@ -403,6 +414,21 @@ async def check_auth(session_id: str):
     return {"status": session["status"], "telegram_id": tid, "username": username}
 
 
+@app.get("/api/notifications/{telegram_id}")
+async def list_login_notifications(telegram_id: int, limit: int = 50):
+    """Уведомления о входе в приложение для личного кабинета на сайте."""
+    lim = max(1, min(limit, 100))
+    res = (
+        supabase.table("login_notifications")
+        .select("id,kind,success,created_at")
+        .eq("telegram_id", telegram_id)
+        .order("created_at", desc=True)
+        .limit(lim)
+        .execute()
+    )
+    return {"items": res.data or []}
+
+
 @app.get("/api/auth/verify/{telegram_id}")
 async def verify_subscription(telegram_id: int):
     user_res = supabase.table("users").select("*").eq("telegram_id", telegram_id).execute()
@@ -453,6 +479,7 @@ async def cmd_start(message: Message):
     )
     if not session_res.data:
         await message.answer("❌ Ссылка недействительна.")
+        save_login_notification(telegram_id, "app_fail_invalid_link", False)
         await send_auth_log(
             "⚠️ Авторизация",
             ["Сбой: недействительная ссылка сессии", f"ID: `{telegram_id}`", f"Username: {username}"],
@@ -479,6 +506,7 @@ async def cmd_start(message: Message):
     if not user_res.data or user_res.data[0]["subscription_until"] < current_time:
         supabase.table("auth_sessions").update({"status": "failed"}).eq("session_id", session_id).execute()
         await message.answer("❌ У вас нет активной подписки.")
+        save_login_notification(telegram_id, "app_fail_no_subscription", False)
         await send_auth_log(
             "⚠️ Вход в приложение отклонён",
             [f"Причина: нет активной подписки", f"ID: `{telegram_id}`", f"Username: {username}"],
@@ -496,6 +524,7 @@ async def cmd_start(message: Message):
             "session_id", session_id
         ).execute()
         await message.answer("✅ Успешный вход! Аккаунт привязан к этому ПК.")
+        save_login_notification(telegram_id, "app_success_first_pc", True)
         await send_auth_log(
             "💻 Вход в приложение",
             [
@@ -510,6 +539,7 @@ async def cmd_start(message: Message):
             "session_id", session_id
         ).execute()
         await message.answer("✅ Успешный вход! Возвращайтесь в программу.")
+        save_login_notification(telegram_id, "app_success_same_pc", True)
         await send_auth_log(
             "💻 Вход в приложение",
             [
@@ -521,6 +551,7 @@ async def cmd_start(message: Message):
     else:
         supabase.table("auth_sessions").update({"status": "failed"}).eq("session_id", session_id).execute()
         await message.answer("❌ Ошибка! Подписка уже используется на другом ПК.")
+        save_login_notification(telegram_id, "app_fail_other_pc", False)
         await send_auth_log(
             "⚠️ Вход в приложение отклонён",
             [
