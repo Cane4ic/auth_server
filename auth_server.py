@@ -17,7 +17,13 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -41,6 +47,9 @@ CHANNEL_INVITE_LINK = (os.environ.get("CHANNEL_INVITE_LINK") or "").strip()
 # Внешние ссылки для кнопок меню (опционально)
 LINK_REVIEWS = (os.environ.get("LINK_REVIEWS") or "").strip()
 LINK_BUY = (os.environ.get("LINK_BUY") or "").strip()
+# Картинка раздела «Тарифы»: локальный файл (приоритет) или URL по HTTPS
+TARIFFS_IMAGE_PATH = (os.environ.get("TARIFFS_IMAGE_PATH") or "").strip()
+TARIFFS_IMAGE_URL = (os.environ.get("TARIFFS_IMAGE_URL") or "").strip()
 LINK_SUPPORT = (os.environ.get("LINK_SUPPORT") or "").strip()
 # Ссылки на документы перед доступом к боту (после подписки на канал)
 LINK_TERMS = (os.environ.get("LINK_TERMS") or "").strip()
@@ -316,6 +325,39 @@ def kb_user_back_main():
     )
 
 
+def text_tariffs_caption_html() -> str:
+    if LINK_TERMS:
+        agree = f'<a href="{html.escape(LINK_TERMS, quote=True)}">пользовательским соглашением</a>'
+    else:
+        agree = "пользовательским соглашением"
+    return (
+        "🔔 Приобретая любую подписку из представленных, вы соглашаетесь с нашим "
+        f"{agree}. 📄\n\n"
+        "Выберите тарифный план:"
+    )
+
+
+def kb_tariffs():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="STANDART", callback_data=f"{UCB}:tariff:s")],
+            [InlineKeyboardButton(text="PRO", callback_data=f"{UCB}:tariff:p")],
+            [InlineKeyboardButton(text="MAX", callback_data=f"{UCB}:tariff:m")],
+            [InlineKeyboardButton(text="TEAM (soon)", callback_data=f"{UCB}:tariff:t")],
+            [InlineKeyboardButton(text="⬅️ Главное меню", callback_data=f"{UCB}:main")],
+        ]
+    )
+
+
+def kb_tariff_subplan_back():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ К тарифам", callback_data=f"{UCB}:tariffs_menu")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data=f"{UCB}:main")],
+        ]
+    )
+
+
 def text_user_main_menu() -> str:
     return (
         "🏠 **Neuro Uploader**\n\n"
@@ -491,16 +533,103 @@ async def verify_subscription(telegram_id: int):
 # --- Telegram: пользователи ---
 
 
+def tariffs_photo_for_new_message() -> Optional[object]:
+    """Для send_photo: FSInputFile с диска или строка URL. None — без картинки."""
+    if TARIFFS_IMAGE_PATH:
+        p = (
+            TARIFFS_IMAGE_PATH
+            if os.path.isabs(TARIFFS_IMAGE_PATH)
+            else os.path.join(os.path.dirname(os.path.abspath(__file__)), TARIFFS_IMAGE_PATH)
+        )
+        if os.path.isfile(p):
+            return FSInputFile(p)
+    if TARIFFS_IMAGE_URL:
+        return TARIFFS_IMAGE_URL
+    return None
+
+
+async def _show_tariffs_text_fallback(
+    query: CallbackQuery, caption: str, markup: InlineKeyboardMarkup
+) -> None:
+    chat_id = query.message.chat.id
+    if query.message.photo:
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await query.bot.send_message(
+            chat_id=chat_id,
+            text=caption,
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+    else:
+        await query.message.edit_text(
+            text=caption,
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+
+
+async def show_user_tariffs_screen(query: CallbackQuery) -> None:
+    caption = text_tariffs_caption_html()
+    markup = kb_tariffs()
+    img = tariffs_photo_for_new_message()
+
+    if img:
+        try:
+            if query.message.photo:
+                await query.message.edit_caption(
+                    caption=caption,
+                    reply_markup=markup,
+                    parse_mode="HTML",
+                )
+            else:
+                chat_id = query.message.chat.id
+                try:
+                    await query.message.delete()
+                except Exception:
+                    pass
+                await query.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=img,
+                    caption=caption,
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                )
+        except Exception as e:
+            print(f"tariffs photo failed: {e}")
+            await _show_tariffs_text_fallback(query, caption, markup)
+    else:
+        await _show_tariffs_text_fallback(query, caption, markup)
+    await query.answer()
+
+
 async def require_policies_or_block(query: CallbackQuery) -> bool:
     """False = показан экран принятия, дальше не идём."""
     uid = query.from_user.id
     if is_admin(uid) or policies_user_has_accepted(uid):
         return True
-    await query.message.edit_text(
-        text_policies_prompt_html(),
-        parse_mode="HTML",
-        reply_markup=kb_policies_accept(),
-    )
+    chat_id = query.message.chat.id
+    prompt = text_policies_prompt_html()
+    markup = kb_policies_accept()
+    if query.message.photo:
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await query.bot.send_message(
+            chat_id=chat_id,
+            text=prompt,
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+    else:
+        await query.message.edit_text(
+            text=prompt,
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
     await query.answer("Сначала примите условия.", show_alert=True)
     return False
 
@@ -704,20 +833,49 @@ async def cb_user_channel_recheck(query: CallbackQuery):
 @dp.callback_query(F.data == f"{UCB}:main")
 async def cb_user_back_main(query: CallbackQuery):
     uid = query.from_user.id
+    chat_id = query.message.chat.id
     if not is_admin(uid) and not policies_user_has_accepted(uid):
-        await query.message.edit_text(
-            text_policies_prompt_html(),
-            parse_mode="HTML",
-            reply_markup=kb_policies_accept(),
-        )
+        prompt = text_policies_prompt_html()
+        markup = kb_policies_accept()
+        if query.message.photo:
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            await query.bot.send_message(
+                chat_id=chat_id,
+                text=prompt,
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+        else:
+            await query.message.edit_text(
+                text=prompt,
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
         await query.answer()
         return
     extra = "\n\n🔐 /admin — панель администратора." if is_admin(uid) else ""
-    await query.message.edit_text(
-        text_user_main_menu() + extra,
-        parse_mode="Markdown",
-        reply_markup=kb_user_main_menu(),
-    )
+    menu_text = text_user_main_menu() + extra
+    menu_markup = kb_user_main_menu()
+    if query.message.photo:
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await query.bot.send_message(
+            chat_id=chat_id,
+            text=menu_text,
+            parse_mode="Markdown",
+            reply_markup=menu_markup,
+        )
+    else:
+        await query.message.edit_text(
+            menu_text,
+            parse_mode="Markdown",
+            reply_markup=menu_markup,
+        )
     await query.answer()
 
 
@@ -755,16 +913,54 @@ async def cb_user_reviews_placeholder(query: CallbackQuery):
 async def cb_user_buy_placeholder(query: CallbackQuery):
     if not await require_policies_or_block(query):
         return
-    text = os.environ.get(
-        "TEXT_BUY",
-        "💳 **Тарифы**\n\nВыберите тариф на сайте или напишите в поддержку. "
-        "Задайте переменную `LINK_BUY` — ссылка откроется по кнопке «Тарифы» в меню.",
-    )
-    await query.message.edit_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=kb_user_back_main(),
-    )
+    await show_user_tariffs_screen(query)
+
+
+@dp.callback_query(F.data == f"{UCB}:tariffs_menu")
+async def cb_user_tariffs_menu(query: CallbackQuery):
+    if not await require_policies_or_block(query):
+        return
+    await show_user_tariffs_screen(query)
+
+
+_TARIFF_PLAN_ENV = {
+    "s": "TEXT_PLAN_STANDART",
+    "p": "TEXT_PLAN_PRO",
+    "m": "TEXT_PLAN_MAX",
+}
+_TARIFF_PLAN_DEFAULT = {
+    "s": "<b>STANDART</b>\n\nОформление — через поддержку или на сайте.",
+    "p": "<b>PRO</b>\n\nОформление — через поддержку или на сайте.",
+    "m": "<b>MAX</b>\n\nОформление — через поддержку или на сайте.",
+}
+
+
+@dp.callback_query(F.data.startswith(f"{UCB}:tariff:"))
+async def cb_user_tariff_plan(query: CallbackQuery):
+    if not await require_policies_or_block(query):
+        return
+    code = (query.data or "").split(":")[-1]
+    if code == "t":
+        await query.answer("Тариф TEAM скоро будет доступен.", show_alert=True)
+        return
+    if code not in _TARIFF_PLAN_ENV:
+        await query.answer()
+        return
+    env_key = _TARIFF_PLAN_ENV[code]
+    sub_text = (os.environ.get(env_key) or "").strip() or _TARIFF_PLAN_DEFAULT[code]
+    markup = kb_tariff_subplan_back()
+    if query.message.photo:
+        await query.message.edit_caption(
+            caption=sub_text,
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+    else:
+        await query.message.edit_text(
+            text=sub_text,
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
     await query.answer()
 
 
