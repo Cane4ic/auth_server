@@ -280,31 +280,30 @@ def kb_policies_accept():
 
 
 def kb_user_main_menu():
-    """Главное меню пользователя."""
-    row_rev = []
+    """Главное меню пользователя: Профиль|Отзывы, Тарифы|Рефералы, Поддержка."""
+    profile_btn = InlineKeyboardButton(text="👤 Профиль", callback_data=f"{UCB}:profile")
     if LINK_REVIEWS:
-        row_rev = [InlineKeyboardButton(text="⭐ Отзывы", url=LINK_REVIEWS)]
+        reviews_btn = InlineKeyboardButton(text="⭐ Отзывы", url=LINK_REVIEWS)
     else:
-        row_rev = [InlineKeyboardButton(text="⭐ Отзывы", callback_data=f"{UCB}:reviews")]
+        reviews_btn = InlineKeyboardButton(text="⭐ Отзывы", callback_data=f"{UCB}:reviews")
 
-    row_buy = []
     if LINK_BUY:
-        row_buy = [InlineKeyboardButton(text="💳 Купить подписку", url=LINK_BUY)]
+        tariffs_btn = InlineKeyboardButton(text="💳 Тарифы", url=LINK_BUY)
     else:
-        row_buy = [InlineKeyboardButton(text="💳 Купить подписку", callback_data=f"{UCB}:buy")]
+        tariffs_btn = InlineKeyboardButton(text="💳 Тарифы", callback_data=f"{UCB}:buy")
 
-    row_sup = []
+    referrals_btn = InlineKeyboardButton(text="🎁 Рефералы", callback_data=f"{UCB}:referrals")
+
     if LINK_SUPPORT:
-        row_sup = [InlineKeyboardButton(text="💬 Поддержка", url=LINK_SUPPORT)]
+        support_btn = InlineKeyboardButton(text="💬 Поддержка", url=LINK_SUPPORT)
     else:
-        row_sup = [InlineKeyboardButton(text="💬 Поддержка", callback_data=f"{UCB}:support")]
+        support_btn = InlineKeyboardButton(text="💬 Поддержка", callback_data=f"{UCB}:support")
 
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="👤 Профиль", callback_data=f"{UCB}:profile")],
-            row_rev,
-            row_buy,
-            row_sup,
+            [profile_btn, reviews_btn],
+            [tariffs_btn, referrals_btn],
+            [support_btn],
         ]
     )
 
@@ -758,8 +757,24 @@ async def cb_user_buy_placeholder(query: CallbackQuery):
         return
     text = os.environ.get(
         "TEXT_BUY",
-        "💳 **Купить подписку**\n\nНапишите в поддержку или перейдите по ссылке из канала. "
-        "Задайте переменную `LINK_BUY` для кнопки с оплатой.",
+        "💳 **Тарифы**\n\nВыберите тариф на сайте или напишите в поддержку. "
+        "Задайте переменную `LINK_BUY` — ссылка откроется по кнопке «Тарифы» в меню.",
+    )
+    await query.message.edit_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=kb_user_back_main(),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == f"{UCB}:referrals")
+async def cb_user_referrals(query: CallbackQuery):
+    if not await require_policies_or_block(query):
+        return
+    text = os.environ.get(
+        "TEXT_REFERRALS",
+        "🎁 **Рефералы**\n\nПрограмма рефералов скоро появится. Следите за новостями в канале.",
     )
     await query.message.edit_text(
         text,
