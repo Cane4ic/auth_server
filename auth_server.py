@@ -42,6 +42,10 @@ CHANNEL_INVITE_LINK = (os.environ.get("CHANNEL_INVITE_LINK") or "").strip()
 LINK_REVIEWS = (os.environ.get("LINK_REVIEWS") or "").strip()
 LINK_BUY = (os.environ.get("LINK_BUY") or "").strip()
 LINK_SUPPORT = (os.environ.get("LINK_SUPPORT") or "").strip()
+# Ссылки на документы перед доступом к боту (после подписки на канал)
+LINK_TERMS = (os.environ.get("LINK_TERMS") or "").strip()
+LINK_PRIVACY = (os.environ.get("LINK_PRIVACY") or "").strip()
+LINK_PRICING = (os.environ.get("LINK_PRICING") or "").strip()
 # Чат для логов входа на сайт / в приложение (числовой id: группа или канал; бот должен быть участником)
 AUTH_LOG_CHAT_ID = (os.environ.get("AUTH_LOG_CHAT_ID") or "").strip()
 
@@ -139,6 +143,30 @@ def user_get(tid: int):
     return r.data[0] if r.data else None
 
 
+def policies_user_has_accepted(telegram_id: int) -> bool:
+    """Пользователь нажал «Принимаю» в боте (таблица policy_acceptances)."""
+    try:
+        r = (
+            supabase.table("policy_acceptances")
+            .select("accepted_at")
+            .eq("telegram_id", telegram_id)
+            .execute()
+        )
+        return bool(r.data and r.data[0].get("accepted_at"))
+    except Exception as e:
+        print(f"policy_acceptances read failed: {e}")
+        return False
+
+
+def record_policies_acceptance(telegram_id: int) -> None:
+    try:
+        supabase.table("policy_acceptances").upsert(
+            {"telegram_id": telegram_id, "accepted_at": int(time.time())}
+        ).execute()
+    except Exception as e:
+        print(f"policy_acceptances upsert failed: {e}")
+
+
 def build_user_card_text(tid: int, u: dict) -> str:
     now = int(time.time())
     sub = u.get("subscription_until") or 0
@@ -224,6 +252,29 @@ def kb_channel_required():
         )
     rows.append(
         [InlineKeyboardButton(text="✅ Я подписался, проверить", callback_data=f"{UCB}:chk")]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def text_policies_prompt_html(extra_html: str = "") -> str:
+    base = (
+        "📌 <b>Доступ к боту</b>\n\n"
+        "Ознакомьтесь с документами по кнопкам ниже, затем нажмите "
+        "<b>Принимаю все условия</b>."
+    )
+    return base + (f"\n\n{extra_html}" if extra_html else "")
+
+
+def kb_policies_accept():
+    rows: list[list[InlineKeyboardButton]] = []
+    if LINK_TERMS:
+        rows.append([InlineKeyboardButton(text="📋 Условия пользования", url=LINK_TERMS)])
+    if LINK_PRIVACY:
+        rows.append([InlineKeyboardButton(text="🔒 Политика конфиденциальности", url=LINK_PRIVACY)])
+    if LINK_PRICING:
+        rows.append([InlineKeyboardButton(text="💰 Ценовая политика", url=LINK_PRICING)])
+    rows.append(
+        [InlineKeyboardButton(text="✅ Принимаю все условия", callback_data=f"{UCB}:policies_ok")]
     )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -441,18 +492,40 @@ async def verify_subscription(telegram_id: int):
 # --- Telegram: пользователи ---
 
 
+async def require_policies_or_block(query: CallbackQuery) -> bool:
+    """False = показан экран принятия, дальше не идём."""
+    uid = query.from_user.id
+    if is_admin(uid) or policies_user_has_accepted(uid):
+        return True
+    await query.message.edit_text(
+        text_policies_prompt_html(),
+        parse_mode="HTML",
+        reply_markup=kb_policies_accept(),
+    )
+    await query.answer("Сначала примите условия.", show_alert=True)
+    return False
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     args = message.text.split() if message.text else []
     if len(args) == 1:
         uid = message.from_user.id
-        # Обычный /start: опционально проверка канала (не для /start с параметром авторизации)
+        # Обычный /start без параметра: канал + условия. /start SESSION (сайт/приложение) — без них.
         if not is_admin(uid) and not await user_passes_channel_gate(uid):
             await message.answer(
                 "📢 Чтобы пользоваться ботом, подпишитесь на наш канал.\n\n"
                 "После подписки нажмите **«Я подписался, проверить»**.",
                 parse_mode="Markdown",
                 reply_markup=kb_channel_required(),
+            )
+            return
+
+        if not is_admin(uid) and not policies_user_has_accepted(uid):
+            await message.answer(
+                text_policies_prompt_html(),
+                parse_mode="HTML",
+                reply_markup=kb_policies_accept(),
             )
             return
 
@@ -470,6 +543,7 @@ async def cmd_start(message: Message):
     telegram_id = message.from_user.id
     username = f"@{message.from_user.username}" if message.from_user.username else str(telegram_id)
 
+    # Вход с сайта / из приложения: без канала и без экрана принятия условий
     session_res = (
         supabase.table("auth_sessions")
         .select("*")
@@ -591,25 +665,55 @@ async def cb_web_login_confirm(query: CallbackQuery):
 # --- Пользователь: главное меню (не затрагивает авторизацию в приложении по deep-link) ---
 
 
+@dp.callback_query(F.data == f"{UCB}:policies_ok")
+async def cb_policies_accept(query: CallbackQuery):
+    uid = query.from_user.id
+    record_policies_acceptance(uid)
+    extra = "\n\n🔐 /admin — панель администратора." if is_admin(uid) else ""
+    await query.message.edit_text(
+        text_user_main_menu() + extra,
+        parse_mode="Markdown",
+        reply_markup=kb_user_main_menu(),
+    )
+    await query.answer("Доступ к боту открыт.")
+
+
 @dp.callback_query(F.data == f"{UCB}:chk")
 async def cb_user_channel_recheck(query: CallbackQuery):
     """Повторная проверка подписки на канал."""
     uid = query.from_user.id
-    if await user_passes_channel_gate(uid):
-        extra = "\n\n🔐 /admin — панель администратора." if is_admin(uid) else ""
-        await query.message.edit_text(
-            text_user_main_menu() + extra,
-            parse_mode="Markdown",
-            reply_markup=kb_user_main_menu(),
-        )
-        await query.answer("✅ Подписка подтверждена!")
-    else:
+    if not await user_passes_channel_gate(uid):
         await query.answer("Сначала подпишитесь на канал.", show_alert=True)
+        return
+    if not is_admin(uid) and not policies_user_has_accepted(uid):
+        await query.message.edit_text(
+            text_policies_prompt_html(),
+            parse_mode="HTML",
+            reply_markup=kb_policies_accept(),
+        )
+        await query.answer("Канал подтверждён. Осталось принять условия.")
+        return
+    extra = "\n\n🔐 /admin — панель администратора." if is_admin(uid) else ""
+    await query.message.edit_text(
+        text_user_main_menu() + extra,
+        parse_mode="Markdown",
+        reply_markup=kb_user_main_menu(),
+    )
+    await query.answer("✅ Подписка подтверждена!")
 
 
 @dp.callback_query(F.data == f"{UCB}:main")
 async def cb_user_back_main(query: CallbackQuery):
-    extra = "\n\n🔐 /admin — панель администратора." if is_admin(query.from_user.id) else ""
+    uid = query.from_user.id
+    if not is_admin(uid) and not policies_user_has_accepted(uid):
+        await query.message.edit_text(
+            text_policies_prompt_html(),
+            parse_mode="HTML",
+            reply_markup=kb_policies_accept(),
+        )
+        await query.answer()
+        return
+    extra = "\n\n🔐 /admin — панель администратора." if is_admin(uid) else ""
     await query.message.edit_text(
         text_user_main_menu() + extra,
         parse_mode="Markdown",
@@ -620,6 +724,8 @@ async def cb_user_back_main(query: CallbackQuery):
 
 @dp.callback_query(F.data == f"{UCB}:profile")
 async def cb_user_profile_menu(query: CallbackQuery):
+    if not await require_policies_or_block(query):
+        return
     tid = query.from_user.id
     u = user_get(tid)
     await query.message.edit_text(
@@ -632,6 +738,8 @@ async def cb_user_profile_menu(query: CallbackQuery):
 
 @dp.callback_query(F.data == f"{UCB}:reviews")
 async def cb_user_reviews_placeholder(query: CallbackQuery):
+    if not await require_policies_or_block(query):
+        return
     text = os.environ.get(
         "TEXT_REVIEWS",
         "⭐ **Отзывы**\n\nЗдесь будет ссылка на отзывы или канал. Укажите `LINK_REVIEWS` в настройках.",
@@ -646,6 +754,8 @@ async def cb_user_reviews_placeholder(query: CallbackQuery):
 
 @dp.callback_query(F.data == f"{UCB}:buy")
 async def cb_user_buy_placeholder(query: CallbackQuery):
+    if not await require_policies_or_block(query):
+        return
     text = os.environ.get(
         "TEXT_BUY",
         "💳 **Купить подписку**\n\nНапишите в поддержку или перейдите по ссылке из канала. "
@@ -661,6 +771,8 @@ async def cb_user_buy_placeholder(query: CallbackQuery):
 
 @dp.callback_query(F.data == f"{UCB}:support")
 async def cb_user_support_placeholder(query: CallbackQuery):
+    if not await require_policies_or_block(query):
+        return
     text = os.environ.get(
         "TEXT_SUPPORT",
         "💬 **Поддержка**\n\nОпишите проблему в ответе на это сообщение или задайте `LINK_SUPPORT` "
