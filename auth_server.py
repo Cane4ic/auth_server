@@ -349,9 +349,34 @@ def kb_tariffs():
     )
 
 
-def kb_tariff_subplan_back():
+def kb_tariff_subplan_detail(code: str) -> InlineKeyboardMarkup:
+    """Экран описания тарифа: купить, назад к списку, главное меню."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Купить", callback_data=f"{UCB}:tbuy:{code}")],
+            [InlineKeyboardButton(text="⬅️ К тарифам", callback_data=f"{UCB}:tariffs_menu")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data=f"{UCB}:main")],
+        ]
+    )
+
+
+def kb_tariff_checkout(code: str) -> InlineKeyboardMarkup:
+    """После «Купить»: Crypto Bot и навигация."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Crypto Bot", callback_data=f"{UCB}:tcry:{code}")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{UCB}:tariff:{code}")],
+            [InlineKeyboardButton(text="⬅️ К тарифам", callback_data=f"{UCB}:tariffs_menu")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data=f"{UCB}:main")],
+        ]
+    )
+
+
+def kb_tariff_stub_payment(code: str) -> InlineKeyboardMarkup:
+    """После выбора Crypto Bot (заглушка ссылки)."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{UCB}:tbuy:{code}")],
             [InlineKeyboardButton(text="⬅️ К тарифам", callback_data=f"{UCB}:tariffs_menu")],
             [InlineKeyboardButton(text="🏠 Главное меню", callback_data=f"{UCB}:main")],
         ]
@@ -962,6 +987,19 @@ _TARIFF_PLAN_DEFAULT = {
 }
 
 
+def tariff_plan_body_html(code: str) -> str:
+    if code not in _TARIFF_PLAN_ENV:
+        return ""
+    env_key = _TARIFF_PLAN_ENV[code]
+    return (os.environ.get(env_key) or "").strip() or _TARIFF_PLAN_DEFAULT[code]
+
+
+def stub_crypto_payment_url(plan_code: str) -> str:
+    """Заглушка: позже заменить на реальную ссылку Crypto Bot API."""
+    base = (os.environ.get("CRYPTO_PAY_STUB_BASE") or "https://pay.stub/neurouploader").strip().rstrip("/")
+    return f"{base}?plan={plan_code}&stub=1"
+
+
 @dp.callback_query(F.data.startswith(f"{UCB}:tariff:"))
 async def cb_user_tariff_plan(query: CallbackQuery):
     if not await require_policies_or_block(query):
@@ -973,9 +1011,8 @@ async def cb_user_tariff_plan(query: CallbackQuery):
     if code not in _TARIFF_PLAN_ENV:
         await query.answer()
         return
-    env_key = _TARIFF_PLAN_ENV[code]
-    sub_text = (os.environ.get(env_key) or "").strip() or _TARIFF_PLAN_DEFAULT[code]
-    markup = kb_tariff_subplan_back()
+    sub_text = tariff_plan_body_html(code)
+    markup = kb_tariff_subplan_detail(code)
     if query.message.photo:
         await query.message.edit_caption(
             caption=sub_text,
@@ -985,6 +1022,65 @@ async def cb_user_tariff_plan(query: CallbackQuery):
     else:
         await query.message.edit_text(
             text=sub_text,
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+    await query.answer()
+
+
+@dp.callback_query(F.data.startswith(f"{UCB}:tbuy:"))
+async def cb_tariff_buy_checkout(query: CallbackQuery):
+    if not await require_policies_or_block(query):
+        return
+    code = (query.data or "").split(":")[-1]
+    if code not in _TARIFF_PLAN_ENV:
+        await query.answer()
+        return
+    body = tariff_plan_body_html(code)
+    checkout_text = f"{body}\n\n<b>Оплата</b>\nВыберите способ:"
+    markup = kb_tariff_checkout(code)
+    if query.message.photo:
+        await query.message.edit_caption(
+            caption=checkout_text,
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+    else:
+        await query.message.edit_text(
+            text=checkout_text,
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+    await query.answer()
+
+
+@dp.callback_query(F.data.startswith(f"{UCB}:tcry:"))
+async def cb_tariff_crypto_stub_pay(query: CallbackQuery):
+    if not await require_policies_or_block(query):
+        return
+    code = (query.data or "").split(":")[-1]
+    if code not in _TARIFF_PLAN_ENV:
+        await query.answer()
+        return
+    pay_url = stub_crypto_payment_url(code)
+    href = html.escape(pay_url, quote=True)
+    body = tariff_plan_body_html(code)
+    pay_text = (
+        f"{body}\n\n"
+        "<b>Оплата через Crypto Bot</b>\n"
+        "Ссылка на оплату (заглушка):\n"
+        f'<a href="{href}">Перейти к оплате</a>'
+    )
+    markup = kb_tariff_stub_payment(code)
+    if query.message.photo:
+        await query.message.edit_caption(
+            caption=pay_text,
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+    else:
+        await query.message.edit_text(
+            text=pay_text,
             parse_mode="HTML",
             reply_markup=markup,
         )
