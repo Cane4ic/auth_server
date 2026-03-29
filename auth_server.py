@@ -10,6 +10,7 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
+import httpx
 import uvicorn
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatMemberStatus
@@ -57,6 +58,15 @@ LINK_PRIVACY = (os.environ.get("LINK_PRIVACY") or "").strip()
 LINK_PRICING = (os.environ.get("LINK_PRICING") or "").strip()
 # Чат для логов входа на сайт / в приложение (числовой id: группа или канал; бот должен быть участником)
 AUTH_LOG_CHAT_ID = (os.environ.get("AUTH_LOG_CHAT_ID") or "").strip()
+# Crypto Pay (@CryptoBot / тест: @CryptoTestnetBot): токен — только CRYPTO_PAY_API_TOKEN в .env, не в коде.
+# true = https://testnet-pay.crypt.bot (приложение из @CryptoTestnetBot); false = боевой pay.crypt.bot
+CRYPTO_PAY_TESTNET = (os.environ.get("CRYPTO_PAY_TESTNET") or "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+CRYPTO_PAY_ASSET = (os.environ.get("CRYPTO_PAY_ASSET") or "TON").strip().upper()
 
 # Короткий префикс callback — лимит Telegram 64 байта (a: админ, u: пользователь)
 CB = "a"
@@ -360,27 +370,15 @@ def kb_tariff_subplan_detail(code: str) -> InlineKeyboardMarkup:
     )
 
 
-def kb_tariff_checkout(code: str) -> InlineKeyboardMarkup:
-    """После «Купить»: Crypto Bot и навигация."""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Crypto Bot", callback_data=f"{UCB}:tcry:{code}")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{UCB}:tariff:{code}")],
-            [InlineKeyboardButton(text="⬅️ К тарифам", callback_data=f"{UCB}:tariffs_menu")],
-            [InlineKeyboardButton(text="🏠 Главное меню", callback_data=f"{UCB}:main")],
-        ]
-    )
-
-
-def kb_tariff_stub_payment(code: str) -> InlineKeyboardMarkup:
-    """После выбора Crypto Bot (заглушка ссылки)."""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{UCB}:tbuy:{code}")],
-            [InlineKeyboardButton(text="⬅️ К тарифам", callback_data=f"{UCB}:tariffs_menu")],
-            [InlineKeyboardButton(text="🏠 Главное меню", callback_data=f"{UCB}:main")],
-        ]
-    )
+def kb_tariff_after_invoice(code: str, pay_url: str) -> InlineKeyboardMarkup:
+    """После createInvoice: открытие оплаты в Crypto Bot + навигация."""
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="💎 Оплатить в Crypto Bot", url=pay_url)],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{UCB}:tariff:{code}")],
+        [InlineKeyboardButton(text="⬅️ К тарифам", callback_data=f"{UCB}:tariffs_menu")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data=f"{UCB}:main")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def text_user_main_menu() -> str:
@@ -994,10 +992,67 @@ def tariff_plan_body_html(code: str) -> str:
     return (os.environ.get(env_key) or "").strip() or _TARIFF_PLAN_DEFAULT[code]
 
 
-def stub_crypto_payment_url(plan_code: str) -> str:
-    """Заглушка: позже заменить на реальную ссылку Crypto Bot API."""
-    base = (os.environ.get("CRYPTO_PAY_STUB_BASE") or "https://pay.stub/neurouploader").strip().rstrip("/")
-    return f"{base}?plan={plan_code}&stub=1"
+_PLAN_INVOICE_LABEL = {"s": "STANDART", "p": "PRO", "m": "MAX"}
+_PLAN_AMOUNT_ENV = {"s": "CRYPTO_PAY_AMOUNT_S", "p": "CRYPTO_PAY_AMOUNT_P", "m": "CRYPTO_PAY_AMOUNT_M"}
+_PLAN_AMOUNT_DEFAULT = {"s": "0.1", "p": "0.15", "m": "0.2"}
+
+
+def tariff_plan_invoice_label(code: str) -> str:
+    return _PLAN_INVOICE_LABEL.get(code, code.upper())
+
+
+def crypto_pay_amount_for_plan(code: str) -> str:
+    ek = _PLAN_AMOUNT_ENV.get(code)
+    if ek:
+        v = (os.environ.get(ek) or "").strip()
+        if v:
+            return v
+    return _PLAN_AMOUNT_DEFAULT.get(code, "0.1")
+
+
+async def crypto_pay_create_invoice(
+    *,
+    asset: str,
+    amount: str,
+    description: str,
+    payload: str,
+) -> tuple[Optional[str], Optional[str]]:
+    """Возвращает (bot_invoice_url, None) или (None, текст_ошибки)."""
+    token = (os.environ.get("CRYPTO_PAY_API_TOKEN") or "").strip()
+    if not token:
+        return None, "Платежи не настроены: задайте CRYPTO_PAY_API_TOKEN в переменных окружения."
+    base = "https://testnet-pay.crypt.bot" if CRYPTO_PAY_TESTNET else "https://pay.crypt.bot"
+    api_url = f"{base}/api/createInvoice"
+    params: dict[str, str] = {
+        "asset": asset,
+        "amount": amount,
+        "description": description[:1024],
+    }
+    if payload:
+        params["payload"] = payload[:4000]
+    headers = {"Crypto-Pay-API-Token": token}
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            r = await client.get(api_url, params=params, headers=headers)
+        try:
+            data = r.json()
+        except Exception:
+            return None, f"Crypto Pay: ответ не JSON (HTTP {r.status_code})."
+    except Exception as e:
+        return None, f"Не удалось связаться с Crypto Pay: {e}"
+    if not data.get("ok"):
+        err = data.get("error") or {}
+        name = err.get("name") or err.get("code") or str(data)
+        return None, f"Crypto Pay: {name}"
+    result = data.get("result") or {}
+    pay_url = (
+        result.get("bot_invoice_url")
+        or result.get("mini_app_invoice_url")
+        or result.get("web_app_invoice_url")
+    )
+    if not pay_url:
+        return None, "Crypto Pay не вернул ссылку на оплату."
+    return str(pay_url), None
 
 
 @dp.callback_query(F.data.startswith(f"{UCB}:tariff:"))
@@ -1029,49 +1084,55 @@ async def cb_user_tariff_plan(query: CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith(f"{UCB}:tbuy:"))
-async def cb_tariff_buy_checkout(query: CallbackQuery):
+async def cb_tariff_buy_crypto_pay(query: CallbackQuery):
     if not await require_policies_or_block(query):
         return
     code = (query.data or "").split(":")[-1]
     if code not in _TARIFF_PLAN_ENV:
         await query.answer()
         return
+    tid = query.from_user.id
+    label = tariff_plan_invoice_label(code)
+    amount = crypto_pay_amount_for_plan(code)
+    asset = CRYPTO_PAY_ASSET
+    desc = f"Neuro Uploader — подписка {label}"
+    payload = f"nu_plan={code};tg={tid}"
+    pay_url, err = await crypto_pay_create_invoice(
+        asset=asset,
+        amount=amount,
+        description=desc,
+        payload=payload,
+    )
     body = tariff_plan_body_html(code)
-    checkout_text = f"{body}\n\n<b>Оплата</b>\nВыберите способ:"
-    markup = kb_tariff_checkout(code)
-    if query.message.photo:
-        await query.message.edit_caption(
-            caption=checkout_text,
-            parse_mode="HTML",
-            reply_markup=markup,
-        )
-    else:
-        await query.message.edit_text(
-            text=checkout_text,
-            parse_mode="HTML",
-            reply_markup=markup,
-        )
-    await query.answer()
-
-
-@dp.callback_query(F.data.startswith(f"{UCB}:tcry:"))
-async def cb_tariff_crypto_stub_pay(query: CallbackQuery):
-    if not await require_policies_or_block(query):
+    if err:
+        fail_text = f"{body}\n\n⚠️ {html.escape(err)}"
+        markup = kb_tariff_subplan_detail(code)
+        if query.message.photo:
+            await query.message.edit_caption(
+                caption=fail_text,
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+        else:
+            await query.message.edit_text(
+                text=fail_text,
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+        await query.answer("Не удалось создать счёт.", show_alert=True)
         return
-    code = (query.data or "").split(":")[-1]
-    if code not in _TARIFF_PLAN_ENV:
-        await query.answer()
-        return
-    pay_url = stub_crypto_payment_url(code)
-    href = html.escape(pay_url, quote=True)
-    body = tariff_plan_body_html(code)
+    net_hint = (
+        "Тестовая оплата через <b>@CryptoTestnetBot</b>."
+        if CRYPTO_PAY_TESTNET
+        else "Оплата через <b>@CryptoBot</b>."
+    )
     pay_text = (
         f"{body}\n\n"
-        "<b>Оплата через Crypto Bot</b>\n"
-        "Ссылка на оплату (заглушка):\n"
-        f'<a href="{href}">Перейти к оплате</a>'
+        f"<b>Счёт Crypto Pay</b>: {html.escape(asset)} {html.escape(amount)}\n"
+        f"{net_hint}\n"
+        "Нажмите кнопку ниже, чтобы открыть оплату."
     )
-    markup = kb_tariff_stub_payment(code)
+    markup = kb_tariff_after_invoice(code, pay_url)
     if query.message.photo:
         await query.message.edit_caption(
             caption=pay_text,
