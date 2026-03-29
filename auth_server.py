@@ -4,10 +4,13 @@ API для приложения + админ-панель в Telegram (толь�
 """
 import asyncio
 import html
+import json
 import os
 import re
 import time
 from datetime import datetime, timezone
+from hashlib import sha256
+from hmac import HMAC, compare_digest
 from typing import Optional
 
 import httpx
@@ -25,8 +28,9 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 from supabase import Client, create_client
 
@@ -160,6 +164,80 @@ def users_fetch_all():
 def user_get(tid: int):
     r = supabase.table("users").select("*").eq("telegram_id", tid).execute()
     return r.data[0] if r.data else None
+
+
+def verify_crypto_pay_webhook_signature(body_text: str, signature_header: str, api_token: str) -> bool:
+    """HMAC-SHA256(hex), секрет = SHA256(api_token) — как в официальных SDK Crypto Pay."""
+    if not signature_header or not api_token:
+        return False
+    secret = sha256(api_token.encode("utf-8")).digest()
+    expected = HMAC(secret, body_text.encode("utf-8"), sha256).hexdigest()
+    return compare_digest(expected, signature_header.strip())
+
+
+def parse_nu_crypto_invoice_payload(raw: Optional[str]) -> tuple[Optional[str], Optional[int]]:
+    """Поле payload счёта: nu_plan=s;tg=123456789."""
+    if not raw or not isinstance(raw, str):
+        return None, None
+    plan, tg = None, None
+    for part in raw.split(";"):
+        part = part.strip()
+        if part.startswith("nu_plan="):
+            plan = part[8:].strip().lower()
+        elif part.startswith("tg="):
+            try:
+                tg = int(part[3:].strip())
+            except ValueError:
+                pass
+    return plan, tg
+
+
+def crypto_invoice_mark_processed(invoice_id: int, telegram_id: int, plan_code: str) -> str:
+    """
+    new — запись создана, начисляем подписку.
+    duplicate — invoice_id уже был (ретрай вебхука).
+    error — ошибка БД (ответьте 5xx, Crypto Pay повторит).
+    """
+    try:
+        supabase.table("crypto_pay_processed_invoices").insert(
+            {
+                "invoice_id": invoice_id,
+                "telegram_id": telegram_id,
+                "plan_code": plan_code,
+                "processed_at": int(time.time()),
+            }
+        ).execute()
+        return "new"
+    except Exception as e:
+        err = str(e).lower()
+        if (
+            "23505" in str(e)
+            or "duplicate" in err
+            or "unique" in err
+            or "violates unique constraint" in err
+        ):
+            return "duplicate"
+        print(f"crypto_pay_processed_invoices insert failed: {e}")
+        return "error"
+
+
+def extend_user_subscription_days(telegram_id: int, days: int) -> int:
+    """Продление от max(now, текущий subscription_until). Возвращает новый unix timestamp."""
+    now = int(time.time())
+    u = user_get(telegram_id)
+    base = now
+    if u:
+        cur = int(u.get("subscription_until") or 0)
+        if cur > base:
+            base = cur
+    until = base + max(1, int(days)) * 86400
+    if u:
+        supabase.table("users").update({"subscription_until": until}).eq("telegram_id", telegram_id).execute()
+    else:
+        supabase.table("users").insert(
+            {"telegram_id": telegram_id, "subscription_until": until, "hwid": None}
+        ).execute()
+    return until
 
 
 def policies_user_has_accepted(telegram_id: int) -> bool:
@@ -477,7 +555,13 @@ def complete_web_site_login_sync(session_id: str, telegram_id: int, username: st
 
 @app.get("/")
 async def root():
-    return {"service": "neuro-uploader-auth", "docs": "/docs", "health": "/health", "ping": "/api/auth/ping"}
+    return {
+        "service": "neuro-uploader-auth",
+        "docs": "/docs",
+        "health": "/health",
+        "ping": "/api/auth/ping",
+        "crypto_pay_webhook": "/api/crypto-pay/webhook",
+    }
 
 
 @app.get("/health")
@@ -490,6 +574,77 @@ async def health():
 async def auth_ping():
     """Проверка из браузера: откройте URL в новой вкладке или fetch с localhost."""
     return {"ok": True}
+
+
+@app.post("/api/crypto-pay/webhook")
+async def crypto_pay_webhook(request: Request):
+    """Вебхук Crypto Pay: оплата счёта → запись в crypto_pay_processed_invoices + продление users.subscription_until."""
+    body_text = (await request.body()).decode("utf-8")
+    sig = (
+        request.headers.get("Crypto-Pay-Api-Signature")
+        or request.headers.get("crypto-pay-api-signature")
+        or ""
+    ).strip()
+    token = (os.environ.get("CRYPTO_PAY_API_TOKEN") or "").strip()
+    if not token:
+        raise HTTPException(status_code=503, detail="CRYPTO_PAY_API_TOKEN не задан")
+    if not verify_crypto_pay_webhook_signature(body_text, sig, token):
+        raise HTTPException(status_code=401, detail="Неверная подпись вебхука")
+    try:
+        data = json.loads(body_text)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Неверный JSON")
+
+    ut = str(data.get("update_type") or data.get("updateType") or "").lower()
+    if ut != "invoice_paid":
+        return PlainTextResponse("OK", status_code=200)
+
+    inv = data.get("payload")
+    if not isinstance(inv, dict):
+        return PlainTextResponse("OK", status_code=200)
+    if str(inv.get("status") or "").lower() != "paid":
+        return PlainTextResponse("OK", status_code=200)
+
+    try:
+        invoice_id = int(inv["invoice_id"])
+    except (KeyError, TypeError, ValueError):
+        return PlainTextResponse("OK", status_code=200)
+
+    plan_code, telegram_id = parse_nu_crypto_invoice_payload(inv.get("payload"))
+    if not plan_code or telegram_id is None:
+        print(f"crypto webhook: нет nu_plan/tg в payload счёта {invoice_id}")
+        return PlainTextResponse("OK", status_code=200)
+    if plan_code not in _TARIFF_PLAN_ENV:
+        print(f"crypto webhook: неизвестный план {plan_code!r}, invoice {invoice_id}")
+        return PlainTextResponse("OK", status_code=200)
+
+    mark = crypto_invoice_mark_processed(invoice_id, telegram_id, plan_code)
+    if mark == "duplicate":
+        return PlainTextResponse("OK", status_code=200)
+    if mark == "error":
+        raise HTTPException(
+            status_code=503,
+            detail="Таблица crypto_pay_processed_invoices недоступна — выполните SQL из crypto_pay_processed_invoices.sql",
+        )
+
+    days = subscription_days_for_plan(plan_code)
+    until = extend_user_subscription_days(telegram_id, days)
+
+    if bot:
+        try:
+            await bot.send_message(
+                chat_id=telegram_id,
+                text=(
+                    "✅ **Оплата получена** — подписка активирована.\n\n"
+                    f"Доступ до: `{fmt_ts(until)}`\n\n"
+                    "Можно входить в приложение с этого Telegram-аккаунта."
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            print(f"crypto pay: уведомление пользователю {telegram_id}: {e}")
+
+    return PlainTextResponse("OK", status_code=200)
 
 
 @app.post("/api/auth/start")
@@ -993,7 +1148,12 @@ def tariff_plan_body_html(code: str) -> str:
 
 
 _PLAN_INVOICE_LABEL = {"s": "STANDART", "p": "PRO", "m": "MAX"}
-_PLAN_AMOUNT_ENV = {"s": "CRYPTO_PAY_AMOUNT_S", "p": "CRYPTO_PAY_AMOUNT_P", "m": "CRYPTO_PAY_AMOUNT_M"}
+# Имена без суффикса _P (в Railway «сырой» ввод переменных ломает строки вроде ..._P=...).
+_PLAN_AMOUNT_ENV_KEYS = {
+    "s": ("CRYPTO_PAY_AMOUNT_STANDART", "CRYPTO_PAY_AMOUNT_S"),
+    "p": ("CRYPTO_PAY_AMOUNT_PRO", "CRYPTO_PAY_AMOUNT_P"),
+    "m": ("CRYPTO_PAY_AMOUNT_MAX", "CRYPTO_PAY_AMOUNT_M"),
+}
 _PLAN_AMOUNT_DEFAULT = {"s": "0.1", "p": "0.15", "m": "0.2"}
 
 
@@ -1002,12 +1162,29 @@ def tariff_plan_invoice_label(code: str) -> str:
 
 
 def crypto_pay_amount_for_plan(code: str) -> str:
-    ek = _PLAN_AMOUNT_ENV.get(code)
-    if ek:
+    for ek in _PLAN_AMOUNT_ENV_KEYS.get(code, ()):
         v = (os.environ.get(ek) or "").strip()
         if v:
             return v
     return _PLAN_AMOUNT_DEFAULT.get(code, "0.1")
+
+
+_PLAN_SUB_DAYS_ENV_KEYS = {
+    "s": ("SUBSCRIPTION_DAYS_STANDART", "SUBSCRIPTION_DAYS_S"),
+    "p": ("SUBSCRIPTION_DAYS_PRO", "SUBSCRIPTION_DAYS_P"),
+    "m": ("SUBSCRIPTION_DAYS_MAX", "SUBSCRIPTION_DAYS_M"),
+}
+_PLAN_SUB_DAYS_DEFAULT = {"s": 30, "p": 30, "m": 30}
+
+
+def subscription_days_for_plan(code: str) -> int:
+    for ek in _PLAN_SUB_DAYS_ENV_KEYS.get(code, ()):
+        v = (os.environ.get(ek) or "").strip()
+        if v.isdigit():
+            d = int(v)
+            if d > 0:
+                return d
+    return max(1, int(_PLAN_SUB_DAYS_DEFAULT.get(code, 30)))
 
 
 async def crypto_pay_create_invoice(
