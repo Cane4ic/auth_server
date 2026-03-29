@@ -240,6 +240,17 @@ def extend_user_subscription_days(telegram_id: int, days: int) -> int:
     return until
 
 
+def user_eligible_for_renewal_price(telegram_id: int) -> bool:
+    """Цена продления: в БД уже был конец подписки (>0), и он уже в прошлом (не новый пользователь с until=0)."""
+    u = user_get(telegram_id)
+    if not u:
+        return False
+    sub = int(u.get("subscription_until") or 0)
+    if sub <= 0:
+        return False
+    return sub < int(time.time())
+
+
 def policies_user_has_accepted(telegram_id: int) -> bool:
     """Пользователь нажал «Принимаю» в боте (таблица policy_acceptances)."""
     try:
@@ -1160,13 +1171,26 @@ _PLAN_AMOUNT_ENV_KEYS = {
     "m": ("CRYPTO_PAY_AMOUNT_MAX", "CRYPTO_PAY_AMOUNT_M"),
 }
 _PLAN_AMOUNT_DEFAULT = {"s": "0.1", "p": "0.15", "m": "0.2"}
+# Продление после истечения подписки (см. user_eligible_for_renewal_price).
+_PLAN_RENEW_AMOUNT_ENV_KEYS = {
+    "s": ("CRYPTO_PAY_RENEW_AMOUNT_STANDART", "CRYPTO_PAY_RENEW_AMOUNT_S"),
+    "p": ("CRYPTO_PAY_RENEW_AMOUNT_PRO", "CRYPTO_PAY_RENEW_AMOUNT_P"),
+    "m": ("CRYPTO_PAY_RENEW_AMOUNT_MAX", "CRYPTO_PAY_RENEW_AMOUNT_M"),
+}
+_PLAN_RENEW_AMOUNT_DEFAULT = {"s": "0.08", "p": "0.12", "m": "0.18"}
 
 
 def tariff_plan_invoice_label(code: str) -> str:
     return _PLAN_INVOICE_LABEL.get(code, code.upper())
 
 
-def crypto_pay_amount_for_plan(code: str) -> str:
+def crypto_pay_amount_for_plan(code: str, *, renewal: bool = False) -> str:
+    if renewal:
+        for ek in _PLAN_RENEW_AMOUNT_ENV_KEYS.get(code, ()):
+            v = (os.environ.get(ek) or "").strip()
+            if v:
+                return v
+        return _PLAN_RENEW_AMOUNT_DEFAULT.get(code, _PLAN_AMOUNT_DEFAULT.get(code, "0.1"))
     for ek in _PLAN_AMOUNT_ENV_KEYS.get(code, ()):
         v = (os.environ.get(ek) or "").strip()
         if v:
@@ -1249,6 +1273,8 @@ async def cb_user_tariff_plan(query: CallbackQuery):
         await query.answer()
         return
     sub_text = tariff_plan_body_html(code)
+    if user_eligible_for_renewal_price(query.from_user.id):
+        sub_text += "\n\n<i>Подписка истекла — по «Купить» будет тариф продления.</i>"
     markup = kb_tariff_subplan_detail(code)
     if query.message.photo:
         await query.message.edit_caption(
@@ -1275,10 +1301,15 @@ async def cb_tariff_buy_crypto_pay(query: CallbackQuery):
         return
     tid = query.from_user.id
     label = tariff_plan_invoice_label(code)
-    amount = crypto_pay_amount_for_plan(code)
+    renewal = user_eligible_for_renewal_price(tid)
+    amount = crypto_pay_amount_for_plan(code, renewal=renewal)
     asset = CRYPTO_PAY_ASSET
-    desc = f"Neuro Uploader — подписка {label}"
-    payload = f"nu_plan={code};tg={tid}"
+    desc = (
+        f"Neuro Uploader — продление {label}"
+        if renewal
+        else f"Neuro Uploader — подписка {label}"
+    )
+    payload = f"nu_plan={code};tg={tid};renew={'1' if renewal else '0'}"
     pay_url, err = await crypto_pay_create_invoice(
         asset=asset,
         amount=amount,
@@ -1308,9 +1339,15 @@ async def cb_tariff_buy_crypto_pay(query: CallbackQuery):
         if CRYPTO_PAY_TESTNET
         else "Оплата через <b>@CryptoBot</b>."
     )
+    price_note = (
+        "<i>Тариф продления</i> (подписка ранее истекла)."
+        if renewal
+        else "<i>Основная цена</i> (новая подписка или активный период)."
+    )
     pay_text = (
         f"{body}\n\n"
         f"<b>Счёт Crypto Pay</b>: {html.escape(asset)} {html.escape(amount)}\n"
+        f"{price_note}\n"
         f"{net_hint}\n"
         "Нажмите кнопку ниже, чтобы открыть оплату."
     )
