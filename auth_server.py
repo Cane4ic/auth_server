@@ -561,6 +561,7 @@ async def root():
         "health": "/health",
         "ping": "/api/auth/ping",
         "crypto_pay_webhook": "/api/crypto-pay/webhook",
+        "crypto_pay_webhook_root": "POST / (алиас, если в Crypto Pay указан только корень домена)",
     }
 
 
@@ -577,8 +578,12 @@ async def auth_ping():
 
 
 @app.post("/api/crypto-pay/webhook")
+@app.post("/")
 async def crypto_pay_webhook(request: Request):
-    """Вебхук Crypto Pay: оплата счёта → запись в crypto_pay_processed_invoices + продление users.subscription_until."""
+    """Вебхук Crypto Pay: оплата счёта → crypto_pay_processed_invoices + продление users.subscription_until.
+
+    Дублируется на POST / — Crypto Pay и Railway часто настроены на корень домена без пути /api/....
+    """
     body_text = (await request.body()).decode("utf-8")
     sig = (
         request.headers.get("Crypto-Pay-Api-Signature")
