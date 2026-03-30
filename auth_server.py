@@ -377,6 +377,45 @@ def set_referral_percent(pct: float) -> None:
     ).execute()
 
 
+def get_user_referral_percent(telegram_id: int) -> tuple[float, bool]:
+    """Персональный процент пользователя; если не задан — глобальный из app_settings."""
+    default_pct = get_referral_percent()
+    try:
+        r = (
+            supabase.table("users")
+            .select("referral_percent")
+            .eq("telegram_id", telegram_id)
+            .limit(1)
+            .execute()
+        )
+        if r.data:
+            raw = r.data[0].get("referral_percent")
+            if raw is not None:
+                pct = max(0.0, min(100.0, float(raw)))
+                return pct, True
+    except Exception as e:
+        print(f"users referral_percent read for {telegram_id}: {e}")
+    return default_pct, False
+
+
+def set_user_referral_percent(telegram_id: int, pct: Optional[float]) -> None:
+    """Установить персональный % (None — использовать глобальный по умолчанию)."""
+    patch: dict[str, Any] = {"referral_percent": None}
+    if pct is not None:
+        patch["referral_percent"] = max(0.0, min(100.0, float(pct)))
+    u = user_get(telegram_id)
+    if u:
+        supabase.table("users").update(patch).eq("telegram_id", telegram_id).execute()
+    else:
+        row: dict[str, Any] = {
+            "telegram_id": telegram_id,
+            "subscription_until": 0,
+            "hwid": None,
+            **patch,
+        }
+        supabase.table("users").insert(row).execute()
+
+
 def ensure_referred_by_set(user_id: int, referrer_id: int) -> None:
     if referrer_id == user_id or referrer_id <= 0:
         return
@@ -423,7 +462,7 @@ async def referral_process_paid_invoice(inv: dict, buyer_id: int, is_renewal_pri
     if not ref_uid or int(ref_uid) == int(buyer_id):
         return
 
-    pct = get_referral_percent()
+    pct, _ = get_user_referral_percent(int(ref_uid))
     if pct <= 0:
         return
 
@@ -656,12 +695,15 @@ def build_user_card_text(tid: int, u: dict) -> str:
     hw = u.get("hwid")
     hw_show = f"<code>{esc_html(hw)}</code>" if hw else "<i>не привязан</i>"
     un = esc_html(u.get("username") or "—")
+    ref_pct, is_override = get_user_referral_percent(tid)
+    ref_src = "персональный" if is_override else "по умолчанию"
     return (
         f"👤 <b>Пользователь</b>\n\n"
         f"• ID: <code>{tid}</code>\n"
         f"• Username: {un}\n"
         f"• Подписка: <b>{esc_html(status)}</b>\n"
         f"• До (UTC): {esc_html(fmt_ts(sub))}\n"
+        f"• Реф. %: <b>{ref_pct:g}%</b> ({ref_src})\n"
         f"• HWID:\n{hw_show}\n"
     )
 
@@ -722,6 +764,10 @@ def kb_user_actions(tid: int):
             [
                 InlineKeyboardButton(text="🗑 Сбросить HWID", callback_data=f"{CB}:h:{tid}"),
                 InlineKeyboardButton(text="✏️ Задать HWID", callback_data=f"{CB}:w:{tid}"),
+            ],
+            [
+                InlineKeyboardButton(text="🎁 Реф. %", callback_data=f"{CB}:urp:{tid}"),
+                InlineKeyboardButton(text="♻️ По умолчанию", callback_data=f"{CB}:urc:{tid}"),
             ],
             [InlineKeyboardButton(text="⬅️ К списку", callback_data=f"{CB}:list:0")],
             [InlineKeyboardButton(text="🏠 Админ-меню", callback_data=f"{CB}:menu")],
@@ -2218,7 +2264,7 @@ async def build_referrals_user_html(uid: int) -> str:
         return "🎁 <b>Рефералы</b>\n\nБот недоступен."
     me = await bot.get_me()
     link = f"https://t.me/{me.username}?start=ref_{uid}"
-    pct = get_referral_percent()
+    pct, _ = get_user_referral_percent(uid)
     n_inv = 0
     try:
         res = supabase.table("users").select("telegram_id").eq("referred_by", uid).execute()
@@ -2799,6 +2845,49 @@ async def cb_hwid_prompt(query: CallbackQuery, state: FSMContext):
     await query.answer()
 
 
+@dp.callback_query(F.data.startswith(f"{CB}:urp:"))
+async def cb_user_referral_percent_prompt(query: CallbackQuery, state: FSMContext):
+    if not is_admin(query.from_user.id):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        tid = int(query.data.split(":")[2])
+    except (IndexError, ValueError):
+        await query.answer("Ошибка ID")
+        return
+    pct, is_override = get_user_referral_percent(tid)
+    origin = "персональный" if is_override else "по умолчанию"
+    await state.set_state(AdminStates.referral_percent)
+    await state.update_data(referral_scope="user", telegram_id=tid)
+    await query.message.answer(
+        f"Введите персональный реферальный % для `{tid}` (0..100).\n"
+        f"Сейчас: **{pct:g}%** ({origin}).\n"
+        "Чтобы убрать персональный % и вернуть значение по умолчанию — кнопка «♻️ По умолчанию» в карточке.\n"
+        "/cancel — отмена.",
+        parse_mode="Markdown",
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data.startswith(f"{CB}:urc:"))
+async def cb_user_referral_percent_clear(query: CallbackQuery, state: FSMContext):
+    if not is_admin(query.from_user.id):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    try:
+        tid = int(query.data.split(":")[2])
+    except (IndexError, ValueError):
+        await query.answer("Ошибка ID")
+        return
+    try:
+        set_user_referral_percent(tid, None)
+    except Exception as e:
+        await query.answer(f"Ошибка: {e}", show_alert=True)
+        return
+    await edit_user_card(query, tid, "♻️ Возвращён % по умолчанию")
+
+
 @dp.message(AdminStates.hwid_value, F.text)
 async def process_hwid(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -2855,6 +2944,27 @@ async def process_referral_percent_input(message: Message, state: FSMContext):
     if pct < 0 or pct > 100:
         await message.answer("Допустимо 0…100.")
         return
+    data = await state.get_data()
+    scope = data.get("referral_scope")
+    if scope == "user":
+        tid = data.get("telegram_id")
+        if not tid:
+            await state.clear()
+            await message.answer("Сессия сброшена. /admin")
+            return
+        try:
+            set_user_referral_percent(int(tid), pct)
+        except Exception as e:
+            await message.answer(f"Не удалось сохранить персональный %: {e}")
+            return
+        await state.clear()
+        await message.answer(
+            f"✅ Персональный реферальный % для `{tid}`: **{pct:g}%**",
+            parse_mode="Markdown",
+            reply_markup=kb_main_admin(),
+        )
+        return
+
     set_referral_percent(pct)
     await state.clear()
     await message.answer(
