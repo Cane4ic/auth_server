@@ -70,6 +70,9 @@ PROFILE_IMAGE_URL = (os.environ.get("PROFILE_IMAGE_URL") or "").strip()
 # Картинка раздела «Отзывы»
 REVIEWS_IMAGE_PATH = (os.environ.get("REVIEWS_IMAGE_PATH") or "").strip()
 REVIEWS_IMAGE_URL = (os.environ.get("REVIEWS_IMAGE_URL") or "").strip()
+# Картинка раздела «Рефералы»
+REFERRALS_IMAGE_PATH = (os.environ.get("REFERRALS_IMAGE_PATH") or "").strip()
+REFERRALS_IMAGE_URL = (os.environ.get("REFERRALS_IMAGE_URL") or "").strip()
 LINK_SUPPORT = (os.environ.get("LINK_SUPPORT") or "").strip()
 # Ссылки на документы перед доступом к боту (после подписки на канал)
 LINK_TERMS = (os.environ.get("LINK_TERMS") or "").strip()
@@ -1737,6 +1740,37 @@ def tariffs_photo_for_new_message() -> Optional[object]:
     return None
 
 
+# Картинка карточки конкретного тарифа (STANDART / PRO / MAX). Первое непустое имя из кортежа.
+_TARIFF_PLAN_IMAGE_PATH_KEYS: dict[str, tuple[str, ...]] = {
+    "s": ("TARIFF_PLAN_IMAGE_PATH_S", "TARIFF_IMAGE_STANDART_PATH"),
+    "p": ("TARIFF_PLAN_IMAGE_PATH_P", "TARIFF_IMAGE_PRO_PATH"),
+    "m": ("TARIFF_PLAN_IMAGE_PATH_M", "TARIFF_IMAGE_MAX_PATH"),
+}
+_TARIFF_PLAN_IMAGE_URL_KEYS: dict[str, tuple[str, ...]] = {
+    "s": ("TARIFF_PLAN_IMAGE_URL_S", "TARIFF_IMAGE_STANDART_URL"),
+    "p": ("TARIFF_PLAN_IMAGE_URL_P", "TARIFF_IMAGE_PRO_URL"),
+    "m": ("TARIFF_PLAN_IMAGE_URL_M", "TARIFF_IMAGE_MAX_URL"),
+}
+
+
+def tariff_plan_photo_for_plan(code: str) -> Optional[object]:
+    """Для карточки тарифа s|p|m: FSInputFile или URL. None — только текст (как раньше)."""
+    if code not in _TARIFF_PLAN_IMAGE_PATH_KEYS:
+        return None
+    for ek in _TARIFF_PLAN_IMAGE_PATH_KEYS[code]:
+        raw = (os.environ.get(ek) or "").strip()
+        if not raw:
+            continue
+        p = raw if os.path.isabs(raw) else os.path.join(os.path.dirname(os.path.abspath(__file__)), raw)
+        if os.path.isfile(p):
+            return FSInputFile(p)
+    for ek in _TARIFF_PLAN_IMAGE_URL_KEYS[code]:
+        raw = (os.environ.get(ek) or "").strip()
+        if raw:
+            return raw
+    return None
+
+
 def _resolve_local_file_path(rel_path: str) -> str:
     """Преобразовать относительный путь в абсолютный относительно auth_server.py."""
     if os.path.isabs(rel_path):
@@ -1890,6 +1924,43 @@ def reviews_photo_for_new_message() -> Optional[object]:
     )
 
 
+def referrals_photo_for_new_message() -> Optional[object]:
+    """Для send_photo: FSInputFile с диска или строка URL. None — без картинки."""
+    if REFERRALS_IMAGE_PATH:
+        p = (
+            REFERRALS_IMAGE_PATH
+            if os.path.isabs(REFERRALS_IMAGE_PATH)
+            else os.path.join(os.path.dirname(os.path.abspath(__file__)), REFERRALS_IMAGE_PATH)
+        )
+        if os.path.isfile(p):
+            return FSInputFile(p)
+    if REFERRALS_IMAGE_URL:
+        return REFERRALS_IMAGE_URL
+    return None
+
+
+async def show_user_referrals_screen(query: CallbackQuery) -> None:
+    """Экран рефералов: отдельное фото или правка текста/подписи."""
+    text = await build_referrals_user_html(query.from_user.id)
+    markup = kb_referrals_screen()
+    img = referrals_photo_for_new_message()
+    if img:
+        chat_id = query.message.chat.id
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await query.bot.send_photo(
+            chat_id=chat_id,
+            photo=img,
+            caption=text,
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+    else:
+        await safe_edit_text(query.message, text, parse_mode="HTML", reply_markup=markup)
+
+
 async def show_user_main_menu(bot_obj: Optional[Bot], chat_id: int, *, extra_caption: str = "") -> None:
     """Главное меню: вместо текста — картинка (send_document) + inline-кнопки."""
     if not bot_obj:
@@ -1963,25 +2034,20 @@ async def show_user_tariffs_screen(query: CallbackQuery) -> None:
 
     if img:
         try:
-            if query.message.photo:
-                await query.message.edit_caption(
-                    caption=caption,
-                    reply_markup=markup,
-                    parse_mode="HTML",
-                )
-            else:
-                chat_id = query.message.chat.id
-                try:
-                    await query.message.delete()
-                except Exception:
-                    pass
-                await query.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=img,
-                    caption=caption,
-                    parse_mode="HTML",
-                    reply_markup=markup,
-                )
+            # Нельзя только edit_caption, если текущее сообщение — фото главного меню:
+            # картинка останется прежней. Удаляем и шлём новое с TARIFFS_IMAGE_*.
+            chat_id = query.message.chat.id
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            await query.bot.send_photo(
+                chat_id=chat_id,
+                photo=img,
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
         except Exception as e:
             print(f"tariffs photo failed: {e}")
             await _show_tariffs_text_fallback(query, caption, markup)
@@ -2520,15 +2586,24 @@ async def cb_user_tariff_plan(query: CallbackQuery):
                     f"Переход на {tariff_plan_invoice_label(code)} — полная стоимость.</i>"
                 )
     markup = kb_tariff_subplan_detail(code)
-    if query.message.photo:
-        await query.message.edit_caption(
+    plan_img = tariff_plan_photo_for_plan(code)
+    if plan_img:
+        chat_id = query.message.chat.id
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        await query.bot.send_photo(
+            chat_id=chat_id,
+            photo=plan_img,
             caption=sub_text,
             parse_mode="HTML",
             reply_markup=markup,
         )
     else:
-        await safe_edit_text(query.message,
-            text=sub_text,
+        await safe_edit_text(
+            query.message,
+            sub_text,
             parse_mode="HTML",
             reply_markup=markup,
         )
@@ -2666,12 +2741,7 @@ async def build_referrals_user_html(uid: int) -> str:
 async def cb_user_referrals(query: CallbackQuery):
     if not await require_policies_or_block(query):
         return
-    text = await build_referrals_user_html(query.from_user.id)
-    await safe_edit_text(query.message,
-        text,
-        parse_mode="HTML",
-        reply_markup=kb_referrals_screen(),
-    )
+    await show_user_referrals_screen(query)
     await query.answer()
 
 
@@ -2707,8 +2777,7 @@ async def cb_user_referral_withdraw_cancel(query: CallbackQuery, state: FSMConte
     if not await require_policies_or_block(query):
         return
     await state.clear()
-    text = await build_referrals_user_html(query.from_user.id)
-    await safe_edit_text(query.message,text, parse_mode="HTML", reply_markup=kb_referrals_screen())
+    await show_user_referrals_screen(query)
     await query.answer("Отменено.")
 
 
@@ -2770,13 +2839,25 @@ async def process_referral_withdraw_amount(message: Message, state: FSMContext):
         await state.clear()
         return
     await state.clear()
-    await message.answer(
+    done_caption = (
         "✅ <b>Чек готов</b>\n\n"
         f"Сумма: <b>{amt:.2f}</b> USD (USDT).\n"
-        f'<a href="{html.escape(url, quote=True)}">Открыть чек в Crypto Bot</a>',
-        parse_mode="HTML",
-        reply_markup=kb_referrals_screen(),
+        f'<a href="{html.escape(url, quote=True)}">Открыть чек в Crypto Bot</a>'
     )
+    ref_img = referrals_photo_for_new_message()
+    if ref_img:
+        await message.answer_photo(
+            photo=ref_img,
+            caption=done_caption,
+            parse_mode="HTML",
+            reply_markup=kb_referrals_screen(),
+        )
+    else:
+        await message.answer(
+            done_caption,
+            parse_mode="HTML",
+            reply_markup=kb_referrals_screen(),
+        )
 
 
 @dp.callback_query(F.data == f"{UCB}:support")
@@ -2824,11 +2905,21 @@ async def cmd_cancel(message: Message, state: FSMContext):
     if current == UserReferralWithdrawStates.amount:
         await state.clear()
         text = await build_referrals_user_html(message.from_user.id)
-        await message.answer(
-            "<i>Отменено.</i>\n\n" + text,
-            parse_mode="HTML",
-            reply_markup=kb_referrals_screen(),
-        )
+        cancel_caption = "<i>Отменено.</i>\n\n" + text
+        ref_img = referrals_photo_for_new_message()
+        if ref_img:
+            await message.answer_photo(
+                photo=ref_img,
+                caption=cancel_caption,
+                parse_mode="HTML",
+                reply_markup=kb_referrals_screen(),
+            )
+        else:
+            await message.answer(
+                cancel_caption,
+                parse_mode="HTML",
+                reply_markup=kb_referrals_screen(),
+            )
         return
     if not is_admin(message.from_user.id):
         return
