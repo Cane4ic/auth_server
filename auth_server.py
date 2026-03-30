@@ -1,6 +1,6 @@
 """
 Сервер авторизации + Telegram-бот Neuro Uploader.
-API для приложения + админ-панель в Telegram (только ADMIN_D).
+API для приложения + админ-панель в Telegram (только ADMIN_ID).
 """
 import asyncio
 import html
@@ -19,6 +19,7 @@ from contextlib import asynccontextmanager
 import httpx
 import uvicorn
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.enums import ChatMemberStatus
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -187,6 +188,16 @@ class UserReferralWithdrawStates(StatesGroup):
 
 def is_admin(user_id: int) -> bool:
     return bool(ADMIN_ID) and user_id == ADMIN_ID
+
+
+async def safe_edit_text(message: Message, text: str, **kwargs) -> None:
+    """Telegram возвращает 400, если новый текст и клавиатура совпадают с текущими (message is not modified)."""
+    try:
+        await message.edit_text(text, **kwargs)
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e).lower():
+            return
+        raise
 
 
 def nu_require_active_subscription(telegram_id: int) -> None:
@@ -662,7 +673,7 @@ async def edit_user_card(query: CallbackQuery, tid: int, answer_popup: Optional[
         await query.answer("Пользователь не найден", show_alert=True)
         return
     text = build_user_card_text(tid, u)
-    await query.message.edit_text(
+    await safe_edit_text(query.message,
         text,
         parse_mode="HTML",
         reply_markup=kb_user_actions(tid),
@@ -1069,14 +1080,12 @@ async def crypto_pay_webhook(request: Request):
                     await bot.send_document(
                         chat_id=telegram_id,
                         document=zip_file_id,
-                        filename=os.path.basename(APP_ZIP_PATH) or "app.zip",
                     )
                     sent_any = True
                 if txt_file_id:
                     await bot.send_document(
                         chat_id=telegram_id,
                         document=txt_file_id,
-                        filename=os.path.basename(APP_TXT_PATH) or "app.txt",
                     )
                     sent_any = True
 
@@ -1088,15 +1097,13 @@ async def crypto_pay_webhook(request: Request):
                 if os.path.isfile(zip_p):
                     await bot.send_document(
                         chat_id=telegram_id,
-                        document=FSInputFile(zip_p),
-                        filename=os.path.basename(zip_p),
+                        document=FSInputFile(zip_p, filename=os.path.basename(zip_p)),
                     )
                     sent_any = True
                 if os.path.isfile(txt_p):
                     await bot.send_document(
                         chat_id=telegram_id,
-                        document=FSInputFile(txt_p),
-                        filename=os.path.basename(txt_p),
+                        document=FSInputFile(txt_p, filename=os.path.basename(txt_p)),
                     )
                     sent_any = True
 
@@ -1546,7 +1553,7 @@ async def _show_tariffs_text_fallback(
             reply_markup=markup,
         )
     else:
-        await query.message.edit_text(
+        await safe_edit_text(query.message,
             text=caption,
             parse_mode="HTML",
             reply_markup=markup,
@@ -1607,7 +1614,7 @@ async def require_policies_or_block(query: CallbackQuery) -> bool:
             reply_markup=markup,
         )
     else:
-        await query.message.edit_text(
+        await safe_edit_text(query.message,
             text=prompt,
             parse_mode="HTML",
             reply_markup=markup,
@@ -1775,7 +1782,7 @@ async def cb_web_login_confirm(query: CallbackQuery):
             "HWID не менялся (только сайт)",
         ],
     )
-    await query.message.edit_text("✅ Вход на сайт выполнен успешно!")
+    await safe_edit_text(query.message,"✅ Вход на сайт выполнен успешно!")
     await query.answer()
 
 
@@ -1803,7 +1810,7 @@ async def cb_user_channel_recheck(query: CallbackQuery):
         await query.answer("Сначала подпишитесь на канал.", show_alert=True)
         return
     if not is_admin(uid) and not policies_user_has_accepted(uid):
-        await query.message.edit_text(
+        await safe_edit_text(query.message,
             text_policies_prompt_html(),
             parse_mode="HTML",
             reply_markup=kb_policies_accept(),
@@ -1839,7 +1846,7 @@ async def cb_user_back_main(query: CallbackQuery, state: FSMContext):
                 reply_markup=markup,
             )
         else:
-            await query.message.edit_text(
+            await safe_edit_text(query.message,
                 text=prompt,
                 parse_mode="HTML",
                 reply_markup=markup,
@@ -1861,7 +1868,7 @@ async def cb_user_profile_menu(query: CallbackQuery):
         return
     tid = query.from_user.id
     u = user_get(tid)
-    await query.message.edit_text(
+    await safe_edit_text(query.message,
         build_user_profile_public_text(tid, u),
         parse_mode="HTML",
         reply_markup=kb_user_back_main(),
@@ -1920,7 +1927,7 @@ async def cb_user_reviews_placeholder(query: CallbackQuery):
             "TEXT_REVIEWS",
             "⭐ **Отзывы**\n\nЗдесь будет ссылка на отзывы или канал. Укажите `LINK_REVIEWS` в настройках.",
         )
-        await query.message.edit_text(
+        await safe_edit_text(query.message,
             text,
             parse_mode="Markdown",
             reply_markup=kb_user_back_main(),
@@ -2124,7 +2131,7 @@ async def cb_user_tariff_plan(query: CallbackQuery):
             reply_markup=markup,
         )
     else:
-        await query.message.edit_text(
+        await safe_edit_text(query.message,
             text=sub_text,
             parse_mode="HTML",
             reply_markup=markup,
@@ -2168,7 +2175,7 @@ async def cb_tariff_buy_crypto_pay(query: CallbackQuery):
                 reply_markup=markup,
             )
         else:
-            await query.message.edit_text(
+            await safe_edit_text(query.message,
                 text=fail_text,
                 parse_mode="HTML",
                 reply_markup=markup,
@@ -2195,7 +2202,7 @@ async def cb_tariff_buy_crypto_pay(query: CallbackQuery):
             reply_markup=markup,
         )
     else:
-        await query.message.edit_text(
+        await safe_edit_text(query.message,
             text=pay_text,
             parse_mode="HTML",
             reply_markup=markup,
@@ -2264,7 +2271,7 @@ async def cb_user_referrals(query: CallbackQuery):
     if not await require_policies_or_block(query):
         return
     text = await build_referrals_user_html(query.from_user.id)
-    await query.message.edit_text(
+    await safe_edit_text(query.message,
         text,
         parse_mode="HTML",
         reply_markup=kb_referrals_screen(),
@@ -2285,7 +2292,7 @@ async def cb_user_referral_withdraw_start(query: CallbackQuery, state: FSMContex
         )
         return
     await state.set_state(UserReferralWithdrawStates.amount)
-    await query.message.edit_text(
+    await safe_edit_text(query.message,
         "💸 <b>Вывод реферального баланса</b>\n\n"
         f"Доступно: <b>{avail:.2f}</b> USD (эквивалент).\n"
         f"Минимум: <b>{REFERRAL_MIN_WITHDRAW_USD:g}</b> USD.\n\n"
@@ -2304,7 +2311,7 @@ async def cb_user_referral_withdraw_cancel(query: CallbackQuery, state: FSMConte
         return
     await state.clear()
     text = await build_referrals_user_html(query.from_user.id)
-    await query.message.edit_text(text, parse_mode="HTML", reply_markup=kb_referrals_screen())
+    await safe_edit_text(query.message,text, parse_mode="HTML", reply_markup=kb_referrals_screen())
     await query.answer("Отменено.")
 
 
@@ -2383,7 +2390,7 @@ async def cb_user_support_placeholder(query: CallbackQuery):
         "💬 **Поддержка**\n\nОпишите проблему в ответе на это сообщение или задайте `LINK_SUPPORT` "
         "(например ссылка на чат с менеджером).",
     )
-    await query.message.edit_text(
+    await safe_edit_text(query.message,
         text,
         parse_mode="Markdown",
         reply_markup=kb_user_back_main(),
@@ -2525,7 +2532,7 @@ async def cb_menu(query: CallbackQuery, state: FSMContext):
         await query.answer("Нет доступа", show_alert=True)
         return
     await state.clear()
-    await query.message.edit_text(
+    await safe_edit_text(query.message,
         "🔐 **Админ-панель Neuro Uploader**",
         parse_mode="Markdown",
         reply_markup=kb_main_admin(),
@@ -2538,7 +2545,7 @@ async def cb_help(query: CallbackQuery):
     if not is_admin(query.from_user.id):
         await query.answer("Нет доступа", show_alert=True)
         return
-    await query.message.edit_text(
+    await safe_edit_text(query.message,
         "📖 **Справка**\n\n"
         "• **Пользователи** — список из базы, пагинация.\n"
         "• **+7 / +30 / +365** — продлить подписку от текущего момента.\n"
@@ -2562,7 +2569,7 @@ async def cb_admin_referral_menu(query: CallbackQuery, state: FSMContext):
         return
     await state.clear()
     pct = get_referral_percent()
-    await query.message.edit_text(
+    await safe_edit_text(query.message,
         f"🎁 **Реферальный процент**\n\n"
         f"Сейчас: **{pct:g}%** от первой оплаты приглашённого (не продления).\n\n"
         "Выберите значение или «Свой %».",
@@ -2588,7 +2595,7 @@ async def cb_admin_referral_set(query: CallbackQuery):
         return
     set_referral_percent(pct)
     await query.answer(f"Установлено {pct:g}%")
-    await query.message.edit_text(
+    await safe_edit_text(query.message,
         f"🎁 **Реферальный процент**\n\n"
         f"Сейчас: **{pct:g}%**",
         parse_mode="Markdown",
@@ -2650,7 +2657,7 @@ async def cb_list(query: CallbackQuery, state: FSMContext):
     if rows:
         markup.inline_keyboard = rows + markup.inline_keyboard
 
-    await query.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    await safe_edit_text(query.message,text, parse_mode="HTML", reply_markup=markup)
     await query.answer()
 
 
