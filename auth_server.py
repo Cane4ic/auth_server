@@ -164,6 +164,8 @@ class AdminStates(StatesGroup):
     sub_days = State()
     hwid_value = State()
     referral_percent = State()
+    app_zip_wait = State()
+    app_txt_wait = State()
 
 
 class UserReferralWithdrawStates(StatesGroup):
@@ -2396,7 +2398,8 @@ async def cmd_admin(message: Message, state: FSMContext):
         "• Просмотр пользователей и подписок\n"
         "• Изменение срока подписки\n"
         "• Сброс и ручная установка HWID\n\n"
-        "Команды вручную: `/add ID дней`, `/reset ID`",
+        "Команды: `/add ID дней`, `/reset ID`\n"
+        "Файлы после оплаты: `/set_app_zip` → затем отправьте zip; `/set_app_txt` → затем txt.",
         parse_mode="Markdown",
         reply_markup=kb_main_admin(),
     )
@@ -2418,6 +2421,65 @@ async def cmd_cancel(message: Message, state: FSMContext):
         return
     await state.clear()
     await message.answer("Отменено.", reply_markup=kb_main_admin())
+
+
+@dp.message(Command("set_app_zip"))
+async def cmd_set_app_zip(message: Message, state: FSMContext):
+    """Шаг 1: команда, затем одним сообщением пришлите файл (zip) как документ."""
+    if not is_admin(message.from_user.id):
+        return
+    await state.set_state(AdminStates.app_zip_wait)
+    await message.answer(
+        "Отправьте **следующим сообщением** файл архива как **документ** (не фото).\n"
+        "Можно переслать из канала. /cancel — отмена.",
+        parse_mode="Markdown",
+    )
+
+
+@dp.message(Command("set_app_txt"))
+async def cmd_set_app_txt(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.set_state(AdminStates.app_txt_wait)
+    await message.answer(
+        "Отправьте **следующим сообщением** файл `.txt` как **документ**.\n"
+        "Можно переслать из канала. /cancel — отмена.",
+        parse_mode="Markdown",
+    )
+
+
+@dp.message(AdminStates.app_zip_wait, F.document)
+async def admin_receive_app_zip_document(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    doc = message.document
+    if not doc:
+        return
+    try:
+        app_setting_upsert_value("app_zip_file_id", doc.file_id)
+    except Exception:
+        await message.answer("Не удалось сохранить в Supabase. Проверьте таблицу app_settings.")
+        return
+    await state.clear()
+    await message.answer("✅ APP_ZIP_FILE_ID сохранён. После оплаты пользователи получат этот архив.")
+
+
+@dp.message(AdminStates.app_txt_wait, F.document)
+async def admin_receive_app_txt_document(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    doc = message.document
+    if not doc:
+        return
+    try:
+        app_setting_upsert_value("app_txt_file_id", doc.file_id)
+    except Exception:
+        await message.answer("Не удалось сохранить в Supabase. Проверьте таблицу app_settings.")
+        return
+    await state.clear()
+    await message.answer("✅ APP_TXT_FILE_ID сохранён.")
 
 
 @dp.message(F.document)
