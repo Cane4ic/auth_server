@@ -56,6 +56,15 @@ LINK_BUY = (os.environ.get("LINK_BUY") or "").strip()
 # Картинка раздела «Тарифы»: локальный файл (приоритет) или URL по HTTPS
 TARIFFS_IMAGE_PATH = (os.environ.get("TARIFFS_IMAGE_PATH") or "").strip()
 TARIFFS_IMAGE_URL = (os.environ.get("TARIFFS_IMAGE_URL") or "").strip()
+# Картинка главного меню: локальный файл (приоритет) или URL по HTTPS
+MAIN_MENU_IMAGE_PATH = (os.environ.get("MAIN_MENU_IMAGE_PATH") or "").strip()
+MAIN_MENU_IMAGE_URL = (os.environ.get("MAIN_MENU_IMAGE_URL") or "").strip()
+# Картинка профиля (доп. сообщение под полем «Действительна»)
+PROFILE_IMAGE_PATH = (os.environ.get("PROFILE_IMAGE_PATH") or "").strip()
+PROFILE_IMAGE_URL = (os.environ.get("PROFILE_IMAGE_URL") or "").strip()
+# Картинка раздела «Отзывы»
+REVIEWS_IMAGE_PATH = (os.environ.get("REVIEWS_IMAGE_PATH") or "").strip()
+REVIEWS_IMAGE_URL = (os.environ.get("REVIEWS_IMAGE_URL") or "").strip()
 LINK_SUPPORT = (os.environ.get("LINK_SUPPORT") or "").strip()
 # Ссылки на документы перед доступом к боту (после подписки на канал)
 LINK_TERMS = (os.environ.get("LINK_TERMS") or "").strip()
@@ -74,6 +83,17 @@ CRYPTO_PAY_TESTNET = (os.environ.get("CRYPTO_PAY_TESTNET") or "true").strip().lo
 CRYPTO_PAY_ASSET = (os.environ.get("CRYPTO_PAY_ASSET") or "TON").strip().upper()
 REFERRAL_PERCENT_DEFAULT = float((os.environ.get("REFERRAL_PERCENT_DEFAULT") or "10").strip())
 REFERRAL_MIN_WITHDRAW_USD = float((os.environ.get("REFERRAL_MIN_WITHDRAW_USD") or "10").strip())
+
+# Файлы выдачи после успешной оплаты подписки
+APP_ZIP_PATH = (os.environ.get("APP_ZIP_PATH") or "app.zip").strip()
+APP_TXT_PATH = (os.environ.get("APP_TXT_PATH") or "app.txt").strip()
+APP_ZIP_URL = (os.environ.get("APP_ZIP_URL") or "").strip()
+APP_TXT_URL = (os.environ.get("APP_TXT_URL") or "").strip()
+APP_ZIP_FILE_ID = (os.environ.get("APP_ZIP_FILE_ID") or "").strip()
+APP_TXT_FILE_ID = (os.environ.get("APP_TXT_FILE_ID") or "").strip()
+
+_APP_FILES_READY = False
+_APP_FILES_LOCK = asyncio.Lock()
 
 # Прокси для десктопа Neuro Uploader: ключи не в клиенте, только на сервере (.env)
 SADCAPTCHA_LICENSE_KEY = (os.environ.get("SADCAPTCHA_LICENSE_KEY") or "").strip()
@@ -736,10 +756,8 @@ def kb_policies_accept():
 def kb_user_main_menu():
     """Главное меню пользователя: Профиль|Отзывы, Тарифы|Рефералы, Поддержка."""
     profile_btn = InlineKeyboardButton(text="👤 Профиль", callback_data=f"{UCB}:profile")
-    if LINK_REVIEWS:
-        reviews_btn = InlineKeyboardButton(text="⭐ Отзывы", url=LINK_REVIEWS)
-    else:
-        reviews_btn = InlineKeyboardButton(text="⭐ Отзывы", callback_data=f"{UCB}:reviews")
+    # По требованию: «Отзывы» — просто картинка, поэтому всегда открываем callback.
+    reviews_btn = InlineKeyboardButton(text="⭐ Отзывы", callback_data=f"{UCB}:reviews")
 
     if LINK_BUY:
         tariffs_btn = InlineKeyboardButton(text="💳 Тарифы", url=LINK_BUY)
@@ -827,18 +845,14 @@ def kb_tariff_after_invoice(code: str, pay_url: str) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [
         [InlineKeyboardButton(text="💎 Оплатить в Crypto Bot", url=pay_url)],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{UCB}:tariff:{code}")],
-        [InlineKeyboardButton(text="⬅️ К тарифам", callback_data=f"{UCB}:tariffs_menu")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data=f"{UCB}:main")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def text_user_main_menu() -> str:
-    return (
-        "🏠 **Neuro Uploader**\n\n"
-        "Выберите раздел ниже.\n\n"
-        "Авторизация в приложении — через кнопку входа в программе (это отдельный сценарий)."
-    )
+    # Главное меню теперь — это картинка, а не текст.
+    return ""
 
 
 def build_user_profile_public_text(tid: int, u: Optional[dict]) -> str:
@@ -852,12 +866,16 @@ def build_user_profile_public_text(tid: int, u: Optional[dict]) -> str:
     now = int(time.time())
     sub = u.get("subscription_until") or 0
     active = sub >= now
-    status = "активна ✅" if active else "истекла ⛔"
+    active_word = "активна" if active else "неактивна"
+    plan_code = (u.get("subscription_plan") or "").strip().lower()
+    plan_label = {"s": "STANDART", "p": "PRO", "m": "MAX"}.get(plan_code, "—")
+    username = (u.get("username") or "").strip() or "—"
     return (
         "👤 <b>Профиль</b>\n\n"
-        f"• Telegram ID: <code>{tid}</code>\n"
-        f"• Подписка: <b>{esc_html(status)}</b>\n"
-        f"• До (UTC): {esc_html(fmt_ts(sub))}\n"
+        f"Username: <b>{esc_html(username)}</b>\n"
+        f"ID: <code>{tid}</code>\n\n"
+        f"Подписка: <b>{esc_html(plan_label)}</b> - <b>{esc_html(active_word)}</b>\n"
+        f"Действительна: <b>{esc_html(fmt_ts(sub))}</b>\n"
     )
 
 
@@ -1024,6 +1042,56 @@ async def crypto_pay_webhook(request: Request):
             )
         except Exception as e:
             print(f"crypto pay: уведомление пользователю {telegram_id}: {e}")
+
+        # Выдача файлов после оплаты
+        try:
+            zip_file_id = get_app_zip_file_id()
+            txt_file_id = get_app_txt_file_id()
+
+            sent_any = False
+            if zip_file_id or txt_file_id:
+                if zip_file_id:
+                    await bot.send_document(
+                        chat_id=telegram_id,
+                        document=zip_file_id,
+                        filename=os.path.basename(APP_ZIP_PATH) or "app.zip",
+                    )
+                    sent_any = True
+                if txt_file_id:
+                    await bot.send_document(
+                        chat_id=telegram_id,
+                        document=txt_file_id,
+                        filename=os.path.basename(APP_TXT_PATH) or "app.txt",
+                    )
+                    sent_any = True
+
+            # Fallback: отправка с диска (если file_id не задан или отсутствует)
+            if not sent_any:
+                await ensure_app_files_downloaded()
+                zip_p = _resolve_local_file_path(APP_ZIP_PATH)
+                txt_p = _resolve_local_file_path(APP_TXT_PATH)
+                if os.path.isfile(zip_p):
+                    await bot.send_document(
+                        chat_id=telegram_id,
+                        document=FSInputFile(zip_p),
+                        filename=os.path.basename(zip_p),
+                    )
+                    sent_any = True
+                if os.path.isfile(txt_p):
+                    await bot.send_document(
+                        chat_id=telegram_id,
+                        document=FSInputFile(txt_p),
+                        filename=os.path.basename(txt_p),
+                    )
+                    sent_any = True
+
+            if not sent_any:
+                await bot.send_message(
+                    chat_id=telegram_id,
+                    text="Файлы для скачивания не найдены. Установите APP_ZIP_FILE_ID/APP_TXT_FILE_ID или разместите файлы на сервере.",
+                )
+        except Exception as e:
+            print(f"crypto pay: send app files failed for {telegram_id}: {e}")
 
     return PlainTextResponse("OK", status_code=200)
 
@@ -1251,6 +1319,208 @@ def tariffs_photo_for_new_message() -> Optional[object]:
     return None
 
 
+def _resolve_local_file_path(rel_path: str) -> str:
+    """Преобразовать относительный путь в абсолютный относительно auth_server.py."""
+    if os.path.isabs(rel_path):
+        return rel_path
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), rel_path)
+
+
+async def _download_http_file(url: str, dst_path: str) -> None:
+    """Скачать файл по HTTP(S) на диск Railway."""
+    dst_dir = os.path.dirname(dst_path)
+    if dst_dir:
+        os.makedirs(dst_dir, exist_ok=True)
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        async with client.stream("GET", url) as r:
+            r.raise_for_status()
+            with open(dst_path, "wb") as f:
+                async for chunk in r.aiter_bytes(chunk_size=1024 * 256):
+                    if chunk:
+                        f.write(chunk)
+
+
+async def ensure_app_files_downloaded() -> None:
+    """Убедиться, что APP_ZIP_PATH/APP_TXT_PATH доступны на диске.
+
+    Если файлов нет и заданы APP_*_URL — скачиваем.
+    """
+    global _APP_FILES_READY
+    if _APP_FILES_READY:
+        return
+    async with _APP_FILES_LOCK:
+        if _APP_FILES_READY:
+            return
+
+        zip_abs = _resolve_local_file_path(APP_ZIP_PATH)
+        txt_abs = _resolve_local_file_path(APP_TXT_PATH)
+
+        zip_exists = os.path.isfile(zip_abs)
+        txt_exists = os.path.isfile(txt_abs)
+
+        # Скачиваем только то, чего нет
+        if not zip_exists and APP_ZIP_URL:
+            await _download_http_file(APP_ZIP_URL, zip_abs)
+            zip_exists = os.path.isfile(zip_abs)
+        if not txt_exists and APP_TXT_URL:
+            await _download_http_file(APP_TXT_URL, txt_abs)
+            txt_exists = os.path.isfile(txt_abs)
+
+        # Находимся в Railway: файловая система часто эфемерная.
+        # Поэтому считаем готовым после одной попытки.
+        _APP_FILES_READY = True
+
+
+def app_setting_get_value(key: str) -> Optional[str]:
+    """Чтение value из app_settings (sync запрос)."""
+    try:
+        r = supabase.table("app_settings").select("value").eq("key", key).execute()
+        if r.data:
+            v = r.data[0].get("value")
+            return str(v) if v is not None else None
+    except Exception as e:
+        print(f"app_settings get {key} failed: {e}")
+    return None
+
+
+def app_setting_upsert_value(key: str, value: str) -> None:
+    """Сохранение value в app_settings (sync запрос)."""
+    try:
+        supabase.table("app_settings").upsert({"key": key, "value": str(value)}).execute()
+    except Exception as e:
+        print(f"app_settings upsert {key} failed: {e}")
+        raise
+
+
+def get_app_zip_file_id() -> Optional[str]:
+    return APP_ZIP_FILE_ID or app_setting_get_value("app_zip_file_id")
+
+
+def get_app_txt_file_id() -> Optional[str]:
+    return APP_TXT_FILE_ID or app_setting_get_value("app_txt_file_id")
+
+
+@app.on_event("startup")
+async def on_startup_download_app_files() -> None:
+    """Скачать архив/текст на Railway при старте (если заданы URL)."""
+    try:
+        await ensure_app_files_downloaded()
+    except Exception as e:
+        # Не валим старт приложения: выдача будет с ошибкой, но бот продолжит работу.
+        print(f"startup: app files download failed: {e}")
+
+
+def _document_asset_for_new_message(*, image_path: str, image_url: str, default_rel_path: str) -> Optional[object]:
+    """Для send_document: FSInputFile (svg/zip/txt) или URL. None — без файла."""
+    candidate = (image_path or "").strip() or default_rel_path
+    p = _resolve_local_file_path(candidate)
+    if p and os.path.isfile(p):
+        return FSInputFile(p)
+    if (image_url or "").strip():
+        return image_url.strip()
+    return None
+
+
+def _photo_asset_for_new_message(*, image_path: str, image_url: str, default_rel_path: str) -> Optional[object]:
+    """Для send_photo: FSInputFile с png/jpg/webp или строка URL. None — без фото."""
+    allowed_ext = {".png", ".jpg", ".jpeg", ".webp"}
+    candidate = (image_path or "").strip() or default_rel_path
+    p = _resolve_local_file_path(candidate)
+    if p and os.path.isfile(p):
+        if os.path.splitext(p)[1].lower() in allowed_ext:
+            return FSInputFile(p)
+    if (image_url or "").strip() and (image_url or "").strip().lower().startswith("http"):
+        return image_url.strip()
+    return None
+
+
+def main_menu_document_for_new_message() -> Optional[object]:
+    return _document_asset_for_new_message(
+        image_path=MAIN_MENU_IMAGE_PATH,
+        image_url=MAIN_MENU_IMAGE_URL,
+        default_rel_path=os.path.join("public", "logo.svg"),
+    )
+
+
+def main_menu_photo_for_new_message() -> Optional[object]:
+    return _photo_asset_for_new_message(
+        image_path=MAIN_MENU_IMAGE_PATH,
+        image_url=MAIN_MENU_IMAGE_URL,
+        default_rel_path=os.path.join("public", "logo.svg"),
+    )
+
+
+def profile_document_for_new_message() -> Optional[object]:
+    return _document_asset_for_new_message(
+        image_path=PROFILE_IMAGE_PATH,
+        image_url=PROFILE_IMAGE_URL,
+        default_rel_path=os.path.join("public", "Union.svg"),
+    )
+
+
+def profile_photo_for_new_message() -> Optional[object]:
+    return _photo_asset_for_new_message(
+        image_path=PROFILE_IMAGE_PATH,
+        image_url=PROFILE_IMAGE_URL,
+        default_rel_path=os.path.join("public", "Union.svg"),
+    )
+
+
+def reviews_document_for_new_message() -> Optional[object]:
+    return _document_asset_for_new_message(
+        image_path=REVIEWS_IMAGE_PATH,
+        image_url=REVIEWS_IMAGE_URL,
+        default_rel_path=os.path.join("public", "Union.svg"),
+    )
+
+
+def reviews_photo_for_new_message() -> Optional[object]:
+    return _photo_asset_for_new_message(
+        image_path=REVIEWS_IMAGE_PATH,
+        image_url=REVIEWS_IMAGE_URL,
+        default_rel_path=os.path.join("public", "Union.svg"),
+    )
+
+
+async def show_user_main_menu(bot_obj: Optional[Bot], chat_id: int, *, extra_caption: str = "") -> None:
+    """Главное меню: вместо текста — картинка (send_document) + inline-кнопки."""
+    if not bot_obj:
+        return
+    extra_caption = (extra_caption or "").strip()
+    photo = main_menu_photo_for_new_message()
+    if photo:
+        try:
+            await bot_obj.send_photo(
+                chat_id=chat_id,
+                photo=photo,
+                caption=extra_caption or None,
+                parse_mode="Markdown",
+                reply_markup=kb_user_main_menu(),
+            )
+            return
+        except Exception as e:
+            print(f"main menu send_photo failed: {e}")
+    doc = main_menu_document_for_new_message()
+    if doc:
+        try:
+            await bot_obj.send_document(
+                chat_id=chat_id,
+                document=doc,
+                caption=extra_caption or None,
+                parse_mode="Markdown",
+                reply_markup=kb_user_main_menu(),
+            )
+            return
+        except Exception as e:
+            print(f"main menu send_document failed: {e}")
+    await bot_obj.send_message(
+        chat_id=chat_id,
+        text=extra_caption or " ",
+        parse_mode="Markdown",
+        reply_markup=kb_user_main_menu(),
+    )
+
+
 async def _show_tariffs_text_fallback(
     query: CallbackQuery, caption: str, markup: InlineKeyboardMarkup
 ) -> None:
@@ -1374,11 +1644,7 @@ async def cmd_start(message: Message):
         extra = ""
         if is_admin(uid):
             extra = "\n\n🔐 /admin — панель администратора."
-        await message.answer(
-            text_user_main_menu() + extra,
-            parse_mode="Markdown",
-            reply_markup=kb_user_main_menu(),
-        )
+        await show_user_main_menu(bot, message.chat.id, extra_caption=extra or "")
         return
 
     session_id = args[1]
@@ -1512,11 +1778,11 @@ async def cb_policies_accept(query: CallbackQuery):
     uid = query.from_user.id
     record_policies_acceptance(uid)
     extra = "\n\n🔐 /admin — панель администратора." if is_admin(uid) else ""
-    await query.message.edit_text(
-        text_user_main_menu() + extra,
-        parse_mode="Markdown",
-        reply_markup=kb_user_main_menu(),
-    )
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    await show_user_main_menu(query.bot, query.message.chat.id, extra_caption=extra or "")
     await query.answer("Доступ к боту открыт.")
 
 
@@ -1536,11 +1802,11 @@ async def cb_user_channel_recheck(query: CallbackQuery):
         await query.answer("Канал подтверждён. Осталось принять условия.")
         return
     extra = "\n\n🔐 /admin — панель администратора." if is_admin(uid) else ""
-    await query.message.edit_text(
-        text_user_main_menu() + extra,
-        parse_mode="Markdown",
-        reply_markup=kb_user_main_menu(),
-    )
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    await show_user_main_menu(query.bot, query.message.chat.id, extra_caption=extra or "")
     await query.answer("✅ Подписка подтверждена!")
 
 
@@ -1572,25 +1838,11 @@ async def cb_user_back_main(query: CallbackQuery, state: FSMContext):
         await query.answer()
         return
     extra = "\n\n🔐 /admin — панель администратора." if is_admin(uid) else ""
-    menu_text = text_user_main_menu() + extra
-    menu_markup = kb_user_main_menu()
-    if query.message.photo:
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
-        await query.bot.send_message(
-            chat_id=chat_id,
-            text=menu_text,
-            parse_mode="Markdown",
-            reply_markup=menu_markup,
-        )
-    else:
-        await query.message.edit_text(
-            menu_text,
-            parse_mode="Markdown",
-            reply_markup=menu_markup,
-        )
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    await show_user_main_menu(query.bot, chat_id, extra_caption=extra or "")
     await query.answer()
 
 
@@ -1605,6 +1857,18 @@ async def cb_user_profile_menu(query: CallbackQuery):
         parse_mode="HTML",
         reply_markup=kb_user_back_main(),
     )
+    photo = profile_photo_for_new_message()
+    doc = None if photo else profile_document_for_new_message()
+    if photo:
+        try:
+            await query.bot.send_photo(chat_id=query.message.chat.id, photo=photo)
+        except Exception as e:
+            print(f"profile photo send failed: {e}")
+    elif doc:
+        try:
+            await query.bot.send_document(chat_id=query.message.chat.id, document=doc)
+        except Exception as e:
+            print(f"profile document send failed: {e}")
     await query.answer()
 
 
@@ -1612,15 +1876,46 @@ async def cb_user_profile_menu(query: CallbackQuery):
 async def cb_user_reviews_placeholder(query: CallbackQuery):
     if not await require_policies_or_block(query):
         return
-    text = os.environ.get(
-        "TEXT_REVIEWS",
-        "⭐ **Отзывы**\n\nЗдесь будет ссылка на отзывы или канал. Укажите `LINK_REVIEWS` в настройках.",
-    )
-    await query.message.edit_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=kb_user_back_main(),
-    )
+    photo = reviews_photo_for_new_message()
+    doc = None if photo else reviews_document_for_new_message()
+    if photo:
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        try:
+            await query.bot.send_photo(
+                chat_id=query.message.chat.id,
+                photo=photo,
+                caption=None,
+                reply_markup=kb_user_back_main(),
+            )
+        except Exception as e:
+            print(f"reviews photo send failed: {e}")
+    elif doc:
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        try:
+            await query.bot.send_document(
+                chat_id=query.message.chat.id,
+                document=doc,
+                caption=None,
+                reply_markup=kb_user_back_main(),
+            )
+        except Exception as e:
+            print(f"reviews document send failed: {e}")
+    else:
+        text = os.environ.get(
+            "TEXT_REVIEWS",
+            "⭐ **Отзывы**\n\nЗдесь будет ссылка на отзывы или канал. Укажите `LINK_REVIEWS` в настройках.",
+        )
+        await query.message.edit_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=kb_user_back_main(),
+        )
     await query.answer()
 
 
@@ -1881,13 +2176,8 @@ async def cb_tariff_buy_crypto_pay(query: CallbackQuery):
         if renewal
         else "<i>Основная цена</i> (новая подписка или активный период)."
     )
-    pay_text = (
-        f"{body}\n\n"
-        f"<b>Счёт Crypto Pay</b>: {html.escape(asset)} {html.escape(amount)}\n"
-        f"{price_note}\n"
-        f"{net_hint}\n"
-        "Нажмите кнопку ниже, чтобы открыть оплату."
-    )
+    # Экран после createInvoice: только выбор варианта оплаты.
+    pay_text = "<b>Выберите вариант оплаты:</b>"
     markup = kb_tariff_after_invoice(code, pay_url)
     if query.message.photo:
         await query.message.edit_caption(
@@ -2128,6 +2418,31 @@ async def cmd_cancel(message: Message, state: FSMContext):
         return
     await state.clear()
     await message.answer("Отменено.", reply_markup=kb_main_admin())
+
+
+@dp.message(F.document)
+async def admin_set_app_file_id_from_document(message: Message):
+    """Админ: отправьте документ в боте с caption:
+    /set_app_zip — app.zip
+    /set_app_txt — app.txt
+    Бот сохранит file_id в Supabase app_settings.
+    """
+    if not is_admin(message.from_user.id):
+        return
+    doc = message.document
+    if not doc:
+        return
+    caption = (message.caption or "").strip()
+    if not caption:
+        return
+    if caption.startswith("/set_app_zip"):
+        app_setting_upsert_value("app_zip_file_id", doc.file_id)
+        await message.answer("✅ APP_ZIP_FILE_ID обновлён (file_id сохранён).")
+        return
+    if caption.startswith("/set_app_txt"):
+        app_setting_upsert_value("app_txt_file_id", doc.file_id)
+        await message.answer("✅ APP_TXT_FILE_ID обновлён (file_id сохранён).")
+        return
 
 
 @dp.callback_query(F.data == f"{CB}:noop")
