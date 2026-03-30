@@ -72,6 +72,11 @@ CRYPTO_PAY_TESTNET = (os.environ.get("CRYPTO_PAY_TESTNET") or "true").strip().lo
 )
 CRYPTO_PAY_ASSET = (os.environ.get("CRYPTO_PAY_ASSET") or "TON").strip().upper()
 
+# Прокси для десктопа Neuro Uploader: ключи не в клиенте, только на сервере (.env)
+SADCAPTCHA_LICENSE_KEY = (os.environ.get("SADCAPTCHA_LICENSE_KEY") or "").strip()
+ANTHROPIC_API_KEY = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+NU_CLAUDE_MODEL = (os.environ.get("NU_CLAUDE_MODEL") or "claude-3-5-sonnet-20241022").strip()
+
 # Короткий префикс callback — лимит Telegram 64 байта (a: админ, u: пользователь)
 CB = "a"
 UCB = "u"
@@ -104,6 +109,33 @@ class AuthRequest(BaseModel):
     hwid: str
 
 
+class NuTelegramBody(BaseModel):
+    telegram_id: int
+
+
+class NuSadPuzzle(NuTelegramBody):
+    puzzleImageB64: str
+    pieceImageB64: str
+
+
+class NuSadRotate(NuTelegramBody):
+    outerImageB64: str
+    innerImageB64: str
+
+
+class NuSadShapes(NuTelegramBody):
+    imageB64: str
+
+
+class NuSadIcon(NuTelegramBody):
+    challenge: str
+    imageB64: str
+
+
+class NuAiPreset(NuTelegramBody):
+    prompt: str
+
+
 class AdminStates(StatesGroup):
     """Ожидание ввода от админа"""
     sub_days = State()
@@ -112,6 +144,14 @@ class AdminStates(StatesGroup):
 
 def is_admin(user_id: int) -> bool:
     return bool(ADMIN_ID) and user_id == ADMIN_ID
+
+
+def nu_require_active_subscription(telegram_id: int) -> None:
+    """Доступ к прокси SadCaptcha / Claude только при активной подписке."""
+    user_res = supabase.table("users").select("subscription_until").eq("telegram_id", telegram_id).execute()
+    now = int(time.time())
+    if not user_res.data or int(user_res.data[0].get("subscription_until") or 0) < now:
+        raise HTTPException(status_code=403, detail="Нет активной подписки")
 
 
 # kind для сайта: app_success_first_pc | app_success_same_pc | app_fail_no_subscription | app_fail_other_pc | app_fail_invalid_link
@@ -741,6 +781,142 @@ async def verify_subscription(telegram_id: int):
     if plan not in ("s", "p", "m"):
         plan = "m"
     return {"status": "success", "message": "Subscription active", "subscription_plan": plan}
+
+
+@app.post("/api/nu/sadcaptcha/puzzle")
+async def nu_sadcaptcha_puzzle(req: NuSadPuzzle):
+    nu_require_active_subscription(req.telegram_id)
+    if not SADCAPTCHA_LICENSE_KEY:
+        raise HTTPException(status_code=503, detail="SadCaptcha не настроен на сервере (SADCAPTCHA_LICENSE_KEY)")
+    url = f"https://www.sadcaptcha.com/api/v1/puzzle?licenseKey={SADCAPTCHA_LICENSE_KEY}"
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            r = await client.post(
+                url,
+                json={"puzzleImageB64": req.puzzleImageB64, "pieceImageB64": req.pieceImageB64},
+            )
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"SadCaptcha HTTP {r.status_code}: {r.text[:500]}")
+        return r.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"SadCaptcha: {e!s}") from e
+
+
+@app.post("/api/nu/sadcaptcha/rotate")
+async def nu_sadcaptcha_rotate(req: NuSadRotate):
+    nu_require_active_subscription(req.telegram_id)
+    if not SADCAPTCHA_LICENSE_KEY:
+        raise HTTPException(status_code=503, detail="SadCaptcha не настроен на сервере (SADCAPTCHA_LICENSE_KEY)")
+    url = f"https://www.sadcaptcha.com/api/v1/rotate?licenseKey={SADCAPTCHA_LICENSE_KEY}"
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            r = await client.post(
+                url,
+                json={"outerImageB64": req.outerImageB64, "innerImageB64": req.innerImageB64},
+            )
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"SadCaptcha HTTP {r.status_code}: {r.text[:500]}")
+        return r.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"SadCaptcha: {e!s}") from e
+
+
+@app.post("/api/nu/sadcaptcha/shapes")
+async def nu_sadcaptcha_shapes(req: NuSadShapes):
+    nu_require_active_subscription(req.telegram_id)
+    if not SADCAPTCHA_LICENSE_KEY:
+        raise HTTPException(status_code=503, detail="SadCaptcha не настроен на сервере (SADCAPTCHA_LICENSE_KEY)")
+    url = f"https://www.sadcaptcha.com/api/v1/shapes?licenseKey={SADCAPTCHA_LICENSE_KEY}"
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            r = await client.post(url, json={"imageB64": req.imageB64})
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"SadCaptcha HTTP {r.status_code}: {r.text[:500]}")
+        return r.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"SadCaptcha: {e!s}") from e
+
+
+@app.post("/api/nu/sadcaptcha/icon")
+async def nu_sadcaptcha_icon(req: NuSadIcon):
+    nu_require_active_subscription(req.telegram_id)
+    if not SADCAPTCHA_LICENSE_KEY:
+        raise HTTPException(status_code=503, detail="SadCaptcha не настроен на сервере (SADCAPTCHA_LICENSE_KEY)")
+    url = f"https://www.sadcaptcha.com/api/v1/icon?licenseKey={SADCAPTCHA_LICENSE_KEY}"
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            r = await client.post(url, json={"challenge": req.challenge, "imageB64": req.imageB64})
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"SadCaptcha HTTP {r.status_code}: {r.text[:500]}")
+        return r.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"SadCaptcha: {e!s}") from e
+
+
+@app.post("/api/nu/ai/preset")
+async def nu_ai_preset(req: NuAiPreset):
+    """Генерация описания/хештегов для пресетов через Claude (ключ только на сервере)."""
+    nu_require_active_subscription(req.telegram_id)
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=503, detail="Anthropic не настроен на сервере (ANTHROPIC_API_KEY)")
+    system_msg = (
+        "Ты — SMM-специалист. По заданному промту создай:\n"
+        "1. Описание видео (1-3 предложения, живой стиль, без эмодзи в начале).\n"
+        "2. Хештеги (5-10 штук через пробел, начинаются с #).\n\n"
+        'Ответь строго в JSON формате: {"description": "...", "hashtags": "#тег1 #тег2 ..."}'
+    )
+    payload = {
+        "model": NU_CLAUDE_MODEL,
+        "max_tokens": 400,
+        "system": system_msg,
+        "messages": [{"role": "user", "content": req.prompt}],
+    }
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": ANTHROPIC_API_KEY,
+                    "anthropic-version": "2023-06-01",
+                },
+                json=payload,
+            )
+        if r.status_code != 200:
+            try:
+                err = r.json()
+                msg = err.get("error", {}).get("message", r.text)
+            except Exception:
+                msg = r.text[:500]
+            raise HTTPException(status_code=502, detail=f"Anthropic {r.status_code}: {msg}")
+        data = r.json()
+        content = data["content"][0]["text"]
+        content = content.strip()
+        if "```" in content:
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+        parsed = json.loads(content.strip())
+        return {
+            "status": "success",
+            "description": parsed.get("description", ""),
+            "hashtags": parsed.get("hashtags", ""),
+            "model": "Claude Sonnet",
+        }
+    except HTTPException:
+        raise
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=502, detail=f"Некорректный JSON от модели: {e!s}") from e
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Claude: {e!s}") from e
 
 
 # --- Telegram: пользователи ---
