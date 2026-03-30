@@ -86,6 +86,11 @@ CRYPTO_PAY_TESTNET = (os.environ.get("CRYPTO_PAY_TESTNET") or "true").strip().lo
 CRYPTO_PAY_ASSET = (os.environ.get("CRYPTO_PAY_ASSET") or "TON").strip().upper()
 REFERRAL_PERCENT_DEFAULT = float((os.environ.get("REFERRAL_PERCENT_DEFAULT") or "10").strip())
 REFERRAL_MIN_WITHDRAW_USD = float((os.environ.get("REFERRAL_MIN_WITHDRAW_USD") or "10").strip())
+REFERRAL_BURN_INACTIVE_DAYS = int((os.environ.get("REFERRAL_BURN_INACTIVE_DAYS") or "30").strip() or "30")
+SUBSCRIPTION_REMINDER_DAYS = (7, 3, 1)
+SUBSCRIPTION_REMINDER_INTERVAL_SEC = int(
+    (os.environ.get("SUBSCRIPTION_REMINDER_INTERVAL_SEC") or "3600").strip() or "3600"
+)
 
 # Файлы выдачи после успешной оплаты подписки
 APP_ZIP_PATH = (os.environ.get("APP_ZIP_PATH") or "app.zip").strip()
@@ -113,11 +118,22 @@ PAGE_SIZE = 7
 @asynccontextmanager
 async def app_lifespan(app: FastAPI):
     """Стартовая загрузка (вместо deprecated on_event)."""
+    reminder_task: Optional[asyncio.Task] = None
     try:
         await ensure_app_files_downloaded()
     except Exception as e:
         print(f"startup: app files download failed: {e}")
-    yield
+    if bot:
+        reminder_task = asyncio.create_task(subscription_reminder_worker())
+    try:
+        yield
+    finally:
+        if reminder_task:
+            reminder_task.cancel()
+            try:
+                await reminder_task
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(lifespan=app_lifespan)
@@ -232,6 +248,100 @@ async def send_auth_log(title: str, lines: list[str]) -> None:
         await bot.send_message(chat_id=int(AUTH_LOG_CHAT_ID), text=text)
     except Exception as e:
         print(f"AUTH_LOG send failed: {e}")
+
+
+def _subscription_reminder_text(days_left: int, until_ts: int) -> str:
+    day_word = "дней"
+    if days_left % 10 == 1 and days_left % 100 != 11:
+        day_word = "день"
+    elif days_left % 10 in (2, 3, 4) and days_left % 100 not in (12, 13, 14):
+        day_word = "дня"
+    return (
+        "⏰ **Напоминание о подписке**\n\n"
+        f"До окончания подписки осталось: **{days_left} {day_word}**.\n"
+        f"Срок действия до: `{fmt_ts(until_ts)}`\n\n"
+        "Продлите подписку заранее, чтобы не потерять доступ."
+    )
+
+
+def reminder_already_sent(telegram_id: int, days_before: int, subscription_until: int) -> bool:
+    try:
+        r = (
+            supabase.table("subscription_reminders")
+            .select("telegram_id")
+            .eq("telegram_id", telegram_id)
+            .eq("days_before", days_before)
+            .eq("subscription_until", subscription_until)
+            .limit(1)
+            .execute()
+        )
+        return bool(r.data)
+    except Exception as e:
+        print(f"subscription_reminders read failed for {telegram_id}: {e}")
+        return False
+
+
+def reminder_mark_sent(telegram_id: int, days_before: int, subscription_until: int) -> None:
+    supabase.table("subscription_reminders").insert(
+        {
+            "telegram_id": telegram_id,
+            "days_before": days_before,
+            "subscription_until": subscription_until,
+            "sent_at": int(time.time()),
+        }
+    ).execute()
+
+
+async def process_subscription_reminders_once() -> None:
+    if not bot:
+        return
+    now = int(time.time())
+    max_window = max(SUBSCRIPTION_REMINDER_DAYS) * 86400
+    try:
+        res = (
+            supabase.table("users")
+            .select("telegram_id,subscription_until")
+            .gt("subscription_until", now)
+            .lte("subscription_until", now + max_window)
+            .execute()
+        )
+    except Exception as e:
+        print(f"subscription reminders users query failed: {e}")
+        return
+    for u in (res.data or []):
+        try:
+            tid = int(u.get("telegram_id") or 0)
+            until = int(u.get("subscription_until") or 0)
+        except (TypeError, ValueError):
+            continue
+        if tid <= 0 or until <= now:
+            continue
+        remaining = until - now
+        for d in SUBSCRIPTION_REMINDER_DAYS:
+            upper = d * 86400
+            lower = (d - 1) * 86400
+            if remaining <= upper and remaining > lower:
+                if reminder_already_sent(tid, d, until):
+                    break
+                try:
+                    await bot.send_message(
+                        chat_id=tid,
+                        text=_subscription_reminder_text(d, until),
+                        parse_mode="Markdown",
+                    )
+                    reminder_mark_sent(tid, d, until)
+                except Exception as e:
+                    print(f"subscription reminder send failed for {tid} ({d}d): {e}")
+                break
+
+
+async def subscription_reminder_worker() -> None:
+    while True:
+        try:
+            await process_subscription_reminders_once()
+        except Exception as e:
+            print(f"subscription reminder worker error: {e}")
+        await asyncio.sleep(max(60, SUBSCRIPTION_REMINDER_INTERVAL_SEC))
 
 
 def esc_html(s: str) -> str:
@@ -439,20 +549,25 @@ def ensure_referred_by_set(user_id: int, referrer_id: int) -> None:
 
 
 async def referral_process_paid_invoice(inv: dict, buyer_id: int, is_renewal_price: bool) -> None:
-    if is_renewal_price:
+    # Начисляем с любой оплаты, но сохраняем идемпотентность по invoice_id.
+    try:
+        invoice_id = int(inv.get("invoice_id") or 0)
+    except (TypeError, ValueError):
+        invoice_id = 0
+    if invoice_id <= 0:
         return
     try:
         chk = (
             supabase.table("referral_rewards")
-            .select("referred_telegram_id")
-            .eq("referred_telegram_id", buyer_id)
+            .select("invoice_id")
+            .eq("invoice_id", invoice_id)
             .limit(1)
             .execute()
         )
         if chk.data:
             return
     except Exception as e:
-        print(f"referral_rewards check: {e}")
+        print(f"referral_rewards invoice check: {e}")
         return
 
     buyer = user_get(buyer_id)
@@ -481,7 +596,6 @@ async def referral_process_paid_invoice(inv: dict, buyer_id: int, is_renewal_pri
         return
 
     asset = str(inv.get("paid_asset") or inv.get("asset") or "TON")
-    invoice_id = int(inv.get("invoice_id") or 0)
     now = int(time.time())
 
     try:
@@ -508,9 +622,9 @@ async def referral_process_paid_invoice(inv: dict, buyer_id: int, is_renewal_pri
             await bot.send_message(
                 int(ref_uid),
                 "💰 **Реферальное вознаграждение**\n\n"
-                f"С первой оплаты вашего реферала: `{reward:.6f}` {asset}\n"
+                f"Начислено: `{reward:.6f}` {asset}\n"
                 f"({pct:g}% от суммы счёта).\n\n"
-                "_Продления и следующие оплаты не участвуют._",
+                "_Начисления действуют с каждой оплаты реферала._",
                 parse_mode="Markdown",
             )
         except Exception as e:
@@ -633,7 +747,108 @@ async def referral_withdrawals_total_usd(telegram_id: int) -> float:
     return s
 
 
+def _parse_any_ts_to_unix(raw: Any) -> Optional[int]:
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        v = int(raw)
+        return v if v > 0 else None
+    s = str(raw).strip()
+    if not s:
+        return None
+    if s.isdigit():
+        v = int(s)
+        return v if v > 0 else None
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return int(dt.timestamp())
+    except Exception:
+        return None
+
+
+async def referral_last_invite_ts(telegram_id: int) -> Optional[int]:
+    """Последний момент, когда у пользователя появился приглашённый."""
+    try:
+        r = (
+            supabase.table("users")
+            .select("created_at")
+            .eq("referred_by", telegram_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if r.data:
+            ts = _parse_any_ts_to_unix(r.data[0].get("created_at"))
+            if ts:
+                return ts
+    except Exception as e:
+        print(f"users last invite ts read failed for {telegram_id}: {e}")
+
+    # Fallback, если нет/нечитаем created_at в users.
+    try:
+        rr = (
+            supabase.table("referral_rewards")
+            .select("created_at")
+            .eq("referrer_telegram_id", telegram_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if rr.data:
+            return _parse_any_ts_to_unix(rr.data[0].get("created_at"))
+    except Exception as e:
+        print(f"referral_rewards last ts read failed for {telegram_id}: {e}")
+    return None
+
+
+async def maybe_burn_inactive_referral_balance(telegram_id: int) -> float:
+    """Сжигает доступный реферальный баланс при отсутствии новых приглашённых."""
+    inactive_days = max(1, int(REFERRAL_BURN_INACTIVE_DAYS))
+    last_invite_ts = await referral_last_invite_ts(telegram_id)
+    if not last_invite_ts:
+        return 0.0
+    now = int(time.time())
+    if now - last_invite_ts < inactive_days * 86400:
+        return 0.0
+
+    earned = await referral_rewards_total_usd(telegram_id)
+    withdrawn = await referral_withdrawals_total_usd(telegram_id)
+    available = max(0.0, earned - withdrawn)
+    if available <= 1e-9:
+        return 0.0
+
+    amt = float(f"{available:.8f}")
+    try:
+        supabase.table("referral_withdrawals").insert(
+            {
+                "telegram_id": telegram_id,
+                "amount_usd": f"{amt:.8f}".rstrip("0").rstrip("."),
+                "asset": "USDT",
+                "check_id": None,
+                "bot_check_url": "burn_inactive_referrals",
+                "created_at": now,
+            }
+        ).execute()
+    except Exception as e:
+        print(f"referral burn insert failed for {telegram_id}: {e}")
+        return 0.0
+
+    if bot:
+        try:
+            await bot.send_message(
+                telegram_id,
+                "⚠️ Реферальный баланс сгорел: не было новых приглашённых более "
+                f"{inactive_days} дней.\n"
+                f"Списано: `{amt:.6f}` USDT (эквивалент).",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            print(f"referral burn notify failed for {telegram_id}: {e}")
+    return amt
+
+
 async def referral_available_usd(telegram_id: int) -> float:
+    await maybe_burn_inactive_referral_balance(telegram_id)
     earned = await referral_rewards_total_usd(telegram_id)
     withdrawn = await referral_withdrawals_total_usd(telegram_id)
     return max(0.0, earned - withdrawn)
@@ -2290,8 +2505,7 @@ async def build_referrals_user_html(uid: int) -> str:
     lines = [
         "🎁 <b>Реферальная программа</b>",
         "",
-        f"Вознаграждение: <b>{pct:g}%</b> от <b>первой</b> оплаты каждого приглашённого по ссылке "
-        "(оплаты по тарифу продления не дают бонус пригласившему).",
+        f"Вознаграждение: <b>{pct:g}%</b> с <b>каждой</b> оплаты каждого приглашённого по ссылке.",
         "",
         "Ваша ссылка:",
         f'<a href="{html.escape(link)}">{html.escape(link)}</a>',
@@ -2308,6 +2522,7 @@ async def build_referrals_user_html(uid: int) -> str:
         "",
         f"Доступно к выводу (≈USD): <b>{avail:.2f}</b>",
         f"Минимум вывода: <b>{REFERRAL_MIN_WITHDRAW_USD:g}</b> USD (чек в USDT).",
+        f"Если новых приглашённых нет более <b>{max(1, REFERRAL_BURN_INACTIVE_DAYS)}</b> дней — баланс сгорает.",
     ]
     return "\n".join(lines)
 
@@ -2598,7 +2813,7 @@ async def cb_help(query: CallbackQuery):
         "• **Свой срок** — введите число **дней** (можно `0` — сразу истекает).\n"
         "• **Сброс HWID** — пользователь сможет войти с нового ПК.\n"
         "• **Задать HWID** — вставьте **64-символьный** hex (как в приложении).\n"
-        "• **Реферальный %** — доля с первой оплаты приглашённого (не продления).\n\n"
+        "• **Реферальный %** — доля с каждой оплаты приглашённого.\n\n"
         "/cancel — отменить ввод.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(
@@ -2617,7 +2832,7 @@ async def cb_admin_referral_menu(query: CallbackQuery, state: FSMContext):
     pct = get_referral_percent()
     await safe_edit_text(query.message,
         f"🎁 **Реферальный процент**\n\n"
-        f"Сейчас: **{pct:g}%** от первой оплаты приглашённого (не продления).\n\n"
+        f"Сейчас: **{pct:g}%** с каждой оплаты приглашённого.\n\n"
         "Выберите значение или «Свой %».",
         parse_mode="Markdown",
         reply_markup=kb_referral_admin(),
