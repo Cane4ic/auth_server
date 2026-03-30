@@ -14,6 +14,8 @@ from hashlib import sha256
 from hmac import HMAC, compare_digest
 from typing import Any, Optional
 
+from contextlib import asynccontextmanager
+
 import httpx
 import uvicorn
 from aiogram import Bot, Dispatcher, F
@@ -106,7 +108,18 @@ UCB = "u"
 
 PAGE_SIZE = 7
 
-app = FastAPI()
+
+@asynccontextmanager
+async def app_lifespan(app: FastAPI):
+    """Стартовая загрузка (вместо deprecated on_event)."""
+    try:
+        await ensure_app_files_downloaded()
+    except Exception as e:
+        print(f"startup: app files download failed: {e}")
+    yield
+
+
+app = FastAPI(lifespan=app_lifespan)
 _raw_cors = (os.environ.get("CORS_ORIGINS") or "*").strip()
 if not _raw_cors or _raw_cors == "*":
     _cors_list = ["*"]
@@ -1400,16 +1413,6 @@ def get_app_zip_file_id() -> Optional[str]:
 
 def get_app_txt_file_id() -> Optional[str]:
     return APP_TXT_FILE_ID or app_setting_get_value("app_txt_file_id")
-
-
-@app.on_event("startup")
-async def on_startup_download_app_files() -> None:
-    """Скачать архив/текст на Railway при старте (если заданы URL)."""
-    try:
-        await ensure_app_files_downloaded()
-    except Exception as e:
-        # Не валим старт приложения: выдача будет с ошибкой, но бот продолжит работу.
-        print(f"startup: app files download failed: {e}")
 
 
 def _document_asset_for_new_message(*, image_path: str, image_url: str, default_rel_path: str) -> Optional[object]:
