@@ -19,6 +19,7 @@ from contextlib import asynccontextmanager
 import httpx
 import uvicorn
 from aiogram import Bot, Dispatcher, F
+from aiogram.dispatcher.event.bases import UNHANDLED
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.enums import ChatMemberStatus
 from aiogram.filters import Command, CommandStart, StateFilter
@@ -27,6 +28,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     CallbackQuery,
+    ErrorEvent,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -212,13 +214,47 @@ def is_admin(user_id: int) -> bool:
 
 
 async def safe_edit_text(message: Message, text: str, **kwargs) -> None:
-    """Telegram возвращает 400, если новый текст и клавиатура совпадают с текущими (message is not modified)."""
+    """Редактирует текст или подпись к фото/документу/видео. Игнорирует «message is not modified».
+    Если сообщение удалено или недоступно для правки — удаляет (если можно) и шлёт новое текстом."""
+    media = bool(
+        message.photo
+        or message.document
+        or message.video
+        or message.animation
+    )
     try:
-        await message.edit_text(text, **kwargs)
+        if media:
+            await message.edit_caption(caption=text, **kwargs)
+        else:
+            await message.edit_text(text, **kwargs)
     except TelegramBadRequest as e:
-        if "message is not modified" in str(e).lower():
+        err = str(e).lower()
+        if "message is not modified" in err:
+            return
+        if "message to edit not found" in err or "message can't be edited" in err:
+            chat_id = message.chat.id
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            await message.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                **kwargs,
+            )
             return
         raise
+
+
+@dp.errors()
+async def _suppress_benign_telegram_errors(event: ErrorEvent):
+    """Не логируем как сбой устаревшие callback (ответ после таймаута Telegram)."""
+    exc = event.exception
+    if isinstance(exc, TelegramBadRequest):
+        msg = str(exc).lower()
+        if "query is too old" in msg or "query id is invalid" in msg:
+            return True
+    return UNHANDLED
 
 
 def nu_require_active_subscription(telegram_id: int) -> None:
