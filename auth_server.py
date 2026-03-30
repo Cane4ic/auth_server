@@ -1,6 +1,6 @@
 """
 Сервер авторизации + Telegram-бот Neuro Uploader.
-API для приложения + админ-панель в Telegram (только ADMIN_ID).
+API для приложения + админ-панель в Telegram (только ADMIN_D).
 """
 import asyncio
 import html
