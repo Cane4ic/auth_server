@@ -1961,6 +1961,62 @@ async def show_user_referrals_screen(query: CallbackQuery) -> None:
         await safe_edit_text(query.message, text, parse_mode="HTML", reply_markup=markup)
 
 
+async def show_user_profile_screen(query: CallbackQuery) -> None:
+    """Профиль: фото или документ с подписью (как рефералы/тарифы), иначе правка текста."""
+    tid = query.from_user.id
+    u = user_get(tid)
+    text = build_user_profile_public_text(tid, u)
+    markup = kb_user_back_main()
+    photo = profile_photo_for_new_message()
+    chat_id = query.message.chat.id
+    if photo:
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        try:
+            await query.bot.send_photo(
+                chat_id=chat_id,
+                photo=photo,
+                caption=text,
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+        except Exception as e:
+            print(f"profile photo send failed: {e}")
+            await query.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+        return
+    doc = profile_document_for_new_message()
+    if doc:
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        try:
+            await query.bot.send_document(
+                chat_id=chat_id,
+                document=doc,
+                caption=text,
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+        except Exception as e:
+            print(f"profile document send failed: {e}")
+            await query.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+        return
+    await safe_edit_text(query.message, text, parse_mode="HTML", reply_markup=markup)
+
+
 async def show_user_main_menu(bot_obj: Optional[Bot], chat_id: int, *, extra_caption: str = "") -> None:
     """Главное меню: вместо текста — картинка (send_document) + inline-кнопки."""
     if not bot_obj:
@@ -2328,25 +2384,7 @@ async def cb_user_back_main(query: CallbackQuery, state: FSMContext):
 async def cb_user_profile_menu(query: CallbackQuery):
     if not await require_policies_or_block(query):
         return
-    tid = query.from_user.id
-    u = user_get(tid)
-    await safe_edit_text(query.message,
-        build_user_profile_public_text(tid, u),
-        parse_mode="HTML",
-        reply_markup=kb_user_back_main(),
-    )
-    photo = profile_photo_for_new_message()
-    doc = None if photo else profile_document_for_new_message()
-    if photo:
-        try:
-            await query.bot.send_photo(chat_id=query.message.chat.id, photo=photo)
-        except Exception as e:
-            print(f"profile photo send failed: {e}")
-    elif doc:
-        try:
-            await query.bot.send_document(chat_id=query.message.chat.id, document=doc)
-        except Exception as e:
-            print(f"profile document send failed: {e}")
+    await show_user_profile_screen(query)
     await query.answer()
 
 
