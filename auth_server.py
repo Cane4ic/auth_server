@@ -8,6 +8,7 @@ import json
 import os
 import re
 import time
+from collections import defaultdict
 from datetime import datetime, timezone
 from hashlib import sha256
 from hmac import HMAC, compare_digest
@@ -71,6 +72,7 @@ CRYPTO_PAY_TESTNET = (os.environ.get("CRYPTO_PAY_TESTNET") or "true").strip().lo
     "on",
 )
 CRYPTO_PAY_ASSET = (os.environ.get("CRYPTO_PAY_ASSET") or "TON").strip().upper()
+REFERRAL_PERCENT_DEFAULT = float((os.environ.get("REFERRAL_PERCENT_DEFAULT") or "10").strip())
 
 # Прокси для десктопа Neuro Uploader: ключи не в клиенте, только на сервере (.env)
 SADCAPTCHA_LICENSE_KEY = (os.environ.get("SADCAPTCHA_LICENSE_KEY") or "").strip()
@@ -140,6 +142,7 @@ class AdminStates(StatesGroup):
     """Ожидание ввода от админа"""
     sub_days = State()
     hwid_value = State()
+    referral_percent = State()
 
 
 def is_admin(user_id: int) -> bool:
@@ -215,11 +218,12 @@ def verify_crypto_pay_webhook_signature(body_text: str, signature_header: str, a
     return compare_digest(expected, signature_header.strip())
 
 
-def parse_nu_crypto_invoice_payload(raw: Optional[str]) -> tuple[Optional[str], Optional[int]]:
-    """Поле payload счёта: nu_plan=s;tg=123456789."""
+def parse_nu_crypto_invoice_payload(raw: Optional[str]) -> tuple[Optional[str], Optional[int], bool]:
+    """Поле payload счёта: nu_plan=s;tg=...;renew=0|1. Третий элемент — тариф продления."""
     if not raw or not isinstance(raw, str):
-        return None, None
+        return None, None, False
     plan, tg = None, None
+    renew = False
     for part in raw.split(";"):
         part = part.strip()
         if part.startswith("nu_plan="):
@@ -229,7 +233,9 @@ def parse_nu_crypto_invoice_payload(raw: Optional[str]) -> tuple[Optional[str], 
                 tg = int(part[3:].strip())
             except ValueError:
                 pass
-    return plan, tg
+        elif part.startswith("renew="):
+            renew = part[6:].strip() == "1"
+    return plan, tg, renew
 
 
 def crypto_invoice_mark_processed(invoice_id: int, telegram_id: int, plan_code: str) -> str:
@@ -302,6 +308,125 @@ def user_eligible_for_renewal_price(telegram_id: int, purchase_plan_code: str) -
     return stored == (purchase_plan_code or "").strip().lower()
 
 
+def get_referral_percent() -> float:
+    try:
+        r = supabase.table("app_settings").select("value").eq("key", "referral_percent").execute()
+        if r.data:
+            v = float(r.data[0]["value"])
+            return max(0.0, min(100.0, v))
+    except Exception as e:
+        print(f"app_settings referral_percent: {e}")
+    return max(0.0, min(100.0, REFERRAL_PERCENT_DEFAULT))
+
+
+def set_referral_percent(pct: float) -> None:
+    pct = max(0.0, min(100.0, float(pct)))
+    supabase.table("app_settings").upsert(
+        {"key": "referral_percent", "value": str(pct)}
+    ).execute()
+
+
+def ensure_referred_by_set(user_id: int, referrer_id: int) -> None:
+    if referrer_id == user_id or referrer_id <= 0:
+        return
+    try:
+        u = user_get(user_id)
+        if u and u.get("referred_by"):
+            return
+        if u:
+            supabase.table("users").update({"referred_by": referrer_id}).eq("telegram_id", user_id).execute()
+        else:
+            supabase.table("users").insert(
+                {
+                    "telegram_id": user_id,
+                    "referred_by": referrer_id,
+                    "subscription_until": 0,
+                    "hwid": None,
+                }
+            ).execute()
+    except Exception as e:
+        print(f"ensure_referred_by_set failed: {e}")
+
+
+async def referral_process_paid_invoice(inv: dict, buyer_id: int, is_renewal_price: bool) -> None:
+    if is_renewal_price:
+        return
+    try:
+        chk = (
+            supabase.table("referral_rewards")
+            .select("referred_telegram_id")
+            .eq("referred_telegram_id", buyer_id)
+            .limit(1)
+            .execute()
+        )
+        if chk.data:
+            return
+    except Exception as e:
+        print(f"referral_rewards check: {e}")
+        return
+
+    buyer = user_get(buyer_id)
+    if not buyer:
+        return
+    ref_uid = buyer.get("referred_by")
+    if not ref_uid or int(ref_uid) == int(buyer_id):
+        return
+
+    pct = get_referral_percent()
+    if pct <= 0:
+        return
+
+    amt_raw = inv.get("paid_amount")
+    if amt_raw is None:
+        amt_raw = inv.get("amount")
+    try:
+        base = float(amt_raw)
+    except (TypeError, ValueError):
+        return
+    if base <= 0:
+        return
+
+    reward = base * pct / 100.0
+    if reward <= 0:
+        return
+
+    asset = str(inv.get("paid_asset") or inv.get("asset") or "TON")
+    invoice_id = int(inv.get("invoice_id") or 0)
+    now = int(time.time())
+
+    try:
+        supabase.table("referral_rewards").insert(
+            {
+                "referred_telegram_id": buyer_id,
+                "referrer_telegram_id": int(ref_uid),
+                "invoice_id": invoice_id,
+                "asset": asset,
+                "reward_amount": f"{reward:.8f}".rstrip("0").rstrip("."),
+                "percent_used": pct,
+                "created_at": now,
+            }
+        ).execute()
+    except Exception as e:
+        err = str(e).lower()
+        if "23505" in str(e) or "duplicate" in err or "unique" in err:
+            return
+        print(f"referral_rewards insert failed: {e}")
+        return
+
+    if bot:
+        try:
+            await bot.send_message(
+                int(ref_uid),
+                "💰 **Реферальное вознаграждение**\n\n"
+                f"С первой оплаты вашего реферала: `{reward:.6f}` {asset}\n"
+                f"({pct:g}% от суммы счёта).\n\n"
+                "_Продления и следующие оплаты не участвуют._",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            print(f"referral notify referrer {ref_uid}: {e}")
+
+
 def policies_user_has_accepted(telegram_id: int) -> bool:
     """Пользователь нажал «Принимаю» в боте (таблица policy_acceptances)."""
     try:
@@ -362,7 +487,25 @@ def kb_main_admin():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📋 Все пользователи", callback_data=f"{CB}:list:0")],
+            [InlineKeyboardButton(text="🎁 Реферальный %", callback_data=f"{CB}:refpct")],
             [InlineKeyboardButton(text="ℹ️ Справка", callback_data=f"{CB}:help")],
+        ]
+    )
+
+
+def kb_referral_admin():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="5%", callback_data=f"{CB}:refset:5"),
+                InlineKeyboardButton(text="10%", callback_data=f"{CB}:refset:10"),
+                InlineKeyboardButton(text="15%", callback_data=f"{CB}:refset:15"),
+            ],
+            [
+                InlineKeyboardButton(text="20%", callback_data=f"{CB}:refset:20"),
+                InlineKeyboardButton(text="Свой %", callback_data=f"{CB}:refcust"),
+            ],
+            [InlineKeyboardButton(text="⬅️ Админ-меню", callback_data=f"{CB}:menu")],
         ]
     )
 
@@ -677,7 +820,7 @@ async def crypto_pay_webhook(request: Request):
     except (KeyError, TypeError, ValueError):
         return PlainTextResponse("OK", status_code=200)
 
-    plan_code, telegram_id = parse_nu_crypto_invoice_payload(inv.get("payload"))
+    plan_code, telegram_id, is_renewal_price = parse_nu_crypto_invoice_payload(inv.get("payload"))
     if not plan_code or telegram_id is None:
         print(f"crypto webhook: нет nu_plan/tg в payload счёта {invoice_id}")
         return PlainTextResponse("OK", status_code=200)
@@ -696,6 +839,8 @@ async def crypto_pay_webhook(request: Request):
 
     days = subscription_days_for_plan(plan_code)
     until = extend_user_subscription_days(telegram_id, days, plan_code=plan_code)
+
+    await referral_process_paid_invoice(inv, telegram_id, is_renewal_price)
 
     if bot:
         try:
@@ -1026,8 +1171,19 @@ async def require_policies_or_block(query: CallbackQuery) -> bool:
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     args = message.text.split() if message.text else []
+    uid = message.from_user.id
+
+    if len(args) >= 2:
+        p0 = args[1].strip()
+        if p0.startswith("ref_"):
+            try:
+                ref_uid = int(p0[4:])
+                ensure_referred_by_set(uid, ref_uid)
+            except ValueError:
+                pass
+            args = [args[0]]
+
     if len(args) == 1:
-        uid = message.from_user.id
         # Обычный /start без параметра: канал + условия. /start SESSION (сайт/приложение) — без них.
         if not is_admin(uid) and not await user_passes_channel_gate(uid):
             await message.answer(
@@ -1578,17 +1734,64 @@ async def cb_tariff_buy_crypto_pay(query: CallbackQuery):
     await query.answer()
 
 
+async def build_referrals_user_html(uid: int) -> str:
+    override = (os.environ.get("TEXT_REFERRALS") or "").strip()
+    if override:
+        return override
+    if not bot:
+        return "🎁 <b>Рефералы</b>\n\nБот недоступен."
+    me = await bot.get_me()
+    link = f"https://t.me/{me.username}?start=ref_{uid}"
+    pct = get_referral_percent()
+    n_inv = 0
+    try:
+        res = supabase.table("users").select("telegram_id").eq("referred_by", uid).execute()
+        n_inv = len(res.data or [])
+    except Exception as e:
+        print(f"referrals count: {e}")
+    totals: defaultdict[str, float] = defaultdict(float)
+    try:
+        rr = (
+            supabase.table("referral_rewards")
+            .select("asset, reward_amount")
+            .eq("referrer_telegram_id", uid)
+            .execute()
+        )
+        for row in rr.data or []:
+            a = str(row.get("asset") or "TON")
+            try:
+                totals[a] += float(row.get("reward_amount") or 0)
+            except ValueError:
+                pass
+    except Exception as e:
+        print(f"referral_rewards sum: {e}")
+    lines = [
+        "🎁 <b>Реферальная программа</b>",
+        "",
+        f"Вознаграждение: <b>{pct:g}%</b> от <b>первой</b> оплаты каждого приглашённого по ссылке "
+        "(оплаты по тарифу продления не дают бонус пригласившему).",
+        "",
+        "Ваша ссылка:",
+        f'<a href="{html.escape(link)}">{html.escape(link)}</a>',
+        "",
+        f"Перешло по ссылке: <b>{n_inv}</b>",
+    ]
+    if totals:
+        parts = [f"{totals[k]:.6f} {k}" for k in sorted(totals.keys())]
+        lines += ["", f"Начислено всего: <b>{html.escape(', '.join(parts))}</b>"]
+    else:
+        lines += ["", "Начислений пока нет — поделитесь ссылкой."]
+    return "\n".join(lines)
+
+
 @dp.callback_query(F.data == f"{UCB}:referrals")
 async def cb_user_referrals(query: CallbackQuery):
     if not await require_policies_or_block(query):
         return
-    text = os.environ.get(
-        "TEXT_REFERRALS",
-        "🎁 **Рефералы**\n\nПрограмма рефералов скоро появится. Следите за новостями в канале.",
-    )
+    text = await build_referrals_user_html(query.from_user.id)
     await query.message.edit_text(
         text,
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=kb_user_back_main(),
     )
     await query.answer()
@@ -1669,12 +1872,67 @@ async def cb_help(query: CallbackQuery):
         "• **+7 / +30 / +365** — продлить подписку от текущего момента.\n"
         "• **Свой срок** — введите число **дней** (можно `0` — сразу истекает).\n"
         "• **Сброс HWID** — пользователь сможет войти с нового ПК.\n"
-        "• **Задать HWID** — вставьте **64-символьный** hex (как в приложении).\n\n"
+        "• **Задать HWID** — вставьте **64-символьный** hex (как в приложении).\n"
+        "• **Реферальный %** — доля с первой оплаты приглашённого (не продления).\n\n"
         "/cancel — отменить ввод.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{CB}:menu")]]
         ),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == f"{CB}:refpct")
+async def cb_admin_referral_menu(query: CallbackQuery, state: FSMContext):
+    if not is_admin(query.from_user.id):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    pct = get_referral_percent()
+    await query.message.edit_text(
+        f"🎁 **Реферальный процент**\n\n"
+        f"Сейчас: **{pct:g}%** от первой оплаты приглашённого (не продления).\n\n"
+        "Выберите значение или «Свой %».",
+        parse_mode="Markdown",
+        reply_markup=kb_referral_admin(),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data.startswith(f"{CB}:refset:"))
+async def cb_admin_referral_set(query: CallbackQuery):
+    if not is_admin(query.from_user.id):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    parts = (query.data or "").split(":")
+    if len(parts) < 3:
+        await query.answer("Ошибка")
+        return
+    try:
+        pct = float(":".join(parts[2:]))
+    except ValueError:
+        await query.answer("Ошибка")
+        return
+    set_referral_percent(pct)
+    await query.answer(f"Установлено {pct:g}%")
+    await query.message.edit_text(
+        f"🎁 **Реферальный процент**\n\n"
+        f"Сейчас: **{pct:g}%**",
+        parse_mode="Markdown",
+        reply_markup=kb_referral_admin(),
+    )
+
+
+@dp.callback_query(F.data == f"{CB}:refcust")
+async def cb_admin_referral_custom(query: CallbackQuery, state: FSMContext):
+    if not is_admin(query.from_user.id):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    await state.set_state(AdminStates.referral_percent)
+    await query.message.answer(
+        "Введите процент от **0** до **100** (можно `12.5`).\n/cancel — отмена.",
+        parse_mode="Markdown",
     )
     await query.answer()
 
@@ -1899,6 +2157,29 @@ async def process_hwid(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
         f"✅ HWID для `{tid}` обновлён.",
+        parse_mode="Markdown",
+        reply_markup=kb_main_admin(),
+    )
+
+
+@dp.message(AdminStates.referral_percent, F.text)
+async def process_referral_percent_input(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    raw = message.text.strip().replace(",", ".")
+    try:
+        pct = float(raw)
+    except ValueError:
+        await message.answer("Нужно число от 0 до 100.")
+        return
+    if pct < 0 or pct > 100:
+        await message.answer("Допустимо 0…100.")
+        return
+    set_referral_percent(pct)
+    await state.clear()
+    await message.answer(
+        f"✅ Процент реферальной программы: **{pct:g}%**",
         parse_mode="Markdown",
         reply_markup=kb_main_admin(),
     )
