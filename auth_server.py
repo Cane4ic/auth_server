@@ -221,8 +221,10 @@ def crypto_invoice_mark_processed(invoice_id: int, telegram_id: int, plan_code: 
         return "error"
 
 
-def extend_user_subscription_days(telegram_id: int, days: int) -> int:
-    """Продление от max(now, текущий subscription_until). Возвращает новый unix timestamp."""
+def extend_user_subscription_days(
+    telegram_id: int, days: int, plan_code: Optional[str] = None
+) -> int:
+    """Продление от max(now, текущий subscription_until). plan_code — записать в users.subscription_plan (оплата Crypto Pay)."""
     now = int(time.time())
     u = user_get(telegram_id)
     base = now
@@ -231,24 +233,33 @@ def extend_user_subscription_days(telegram_id: int, days: int) -> int:
         if cur > base:
             base = cur
     until = base + max(1, int(days)) * 86400
+    patch: dict = {"subscription_until": until}
+    if plan_code:
+        patch["subscription_plan"] = plan_code
     if u:
-        supabase.table("users").update({"subscription_until": until}).eq("telegram_id", telegram_id).execute()
+        supabase.table("users").update(patch).eq("telegram_id", telegram_id).execute()
     else:
-        supabase.table("users").insert(
-            {"telegram_id": telegram_id, "subscription_until": until, "hwid": None}
-        ).execute()
+        row = {"telegram_id": telegram_id, "subscription_until": until, "hwid": None}
+        if plan_code:
+            row["subscription_plan"] = plan_code
+        supabase.table("users").insert(row).execute()
     return until
 
 
-def user_eligible_for_renewal_price(telegram_id: int) -> bool:
-    """Цена продления: в БД уже был конец подписки (>0), и он уже в прошлом (не новый пользователь с until=0)."""
+def user_eligible_for_renewal_price(telegram_id: int, purchase_plan_code: str) -> bool:
+    """Цена продления только если срок истёк и покупают тот же тариф, что был при последней Crypto Pay оплате."""
     u = user_get(telegram_id)
     if not u:
         return False
     sub = int(u.get("subscription_until") or 0)
     if sub <= 0:
         return False
-    return sub < int(time.time())
+    if sub >= int(time.time()):
+        return False
+    stored = (u.get("subscription_plan") or "").strip().lower()
+    if not stored:
+        return False
+    return stored == (purchase_plan_code or "").strip().lower()
 
 
 def policies_user_has_accepted(telegram_id: int) -> bool:
@@ -644,7 +655,7 @@ async def crypto_pay_webhook(request: Request):
         )
 
     days = subscription_days_for_plan(plan_code)
-    until = extend_user_subscription_days(telegram_id, days)
+    until = extend_user_subscription_days(telegram_id, days, plan_code=plan_code)
 
     if bot:
         try:
@@ -1273,8 +1284,24 @@ async def cb_user_tariff_plan(query: CallbackQuery):
         await query.answer()
         return
     sub_text = tariff_plan_body_html(code)
-    if user_eligible_for_renewal_price(query.from_user.id):
-        sub_text += "\n\n<i>Подписка истекла — по «Купить» будет тариф продления.</i>"
+    uid = query.from_user.id
+    if user_eligible_for_renewal_price(uid, code):
+        sub_text += "\n\n<i>По «Купить» — цена продления (тот же тариф).</i>"
+    else:
+        u = user_get(uid)
+        if u:
+            sub_u = int(u.get("subscription_until") or 0)
+            stored = (u.get("subscription_plan") or "").strip().lower()
+            if (
+                sub_u > 0
+                and sub_u < int(time.time())
+                and stored in _TARIFF_PLAN_ENV
+                and stored != code
+            ):
+                sub_text += (
+                    f"\n\n<i>Ранее: {tariff_plan_invoice_label(stored)}. "
+                    f"Переход на {tariff_plan_invoice_label(code)} — полная стоимость.</i>"
+                )
     markup = kb_tariff_subplan_detail(code)
     if query.message.photo:
         await query.message.edit_caption(
@@ -1301,7 +1328,7 @@ async def cb_tariff_buy_crypto_pay(query: CallbackQuery):
         return
     tid = query.from_user.id
     label = tariff_plan_invoice_label(code)
-    renewal = user_eligible_for_renewal_price(tid)
+    renewal = user_eligible_for_renewal_price(tid, code)
     amount = crypto_pay_amount_for_plan(code, renewal=renewal)
     asset = CRYPTO_PAY_ASSET
     desc = (
