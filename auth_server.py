@@ -732,7 +732,15 @@ async def verify_subscription(telegram_id: int):
     current_time = int(time.time())
     if not user_res.data or user_res.data[0]["subscription_until"] < current_time:
         return {"status": "failed", "message": "Subscription expired or user not found"}
-    return {"status": "success", "message": "Subscription active"}
+    u = user_res.data[0]
+    plan = (u.get("subscription_plan") or "m")
+    if isinstance(plan, str):
+        plan = plan.strip().lower()
+    else:
+        plan = "m"
+    if plan not in ("s", "p", "m"):
+        plan = "m"
+    return {"status": "success", "message": "Subscription active", "subscription_plan": plan}
 
 
 # --- Telegram: пользователи ---
