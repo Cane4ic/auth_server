@@ -21,7 +21,7 @@ import uvicorn
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.enums import ChatMemberStatus
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -111,6 +111,7 @@ NU_CLAUDE_MODEL = (os.environ.get("NU_CLAUDE_MODEL") or "claude-3-5-sonnet-20241
 # Короткий префикс callback — лимит Telegram 64 байта (a: админ, u: пользователь)
 CB = "a"
 UCB = "u"
+CB_REF_MIN = f"{CB}:rwmin"
 
 PAGE_SIZE = 7
 
@@ -194,8 +195,12 @@ class AdminStates(StatesGroup):
     sub_days = State()
     hwid_value = State()
     referral_percent = State()
+    referral_balance_set = State()
+    referral_min_withdraw = State()
     app_zip_wait = State()
     app_txt_wait = State()
+    broadcast_wait = State()
+    broadcast_confirm = State()
 
 
 class UserReferralWithdrawStates(StatesGroup):
@@ -365,9 +370,59 @@ def users_fetch_all():
     return res.data or []
 
 
+def users_telegram_ids_for_broadcast() -> list[int]:
+    """ID для массовой рассылки (до BROADCAST_MAX_USERS записей)."""
+    lim = int((os.environ.get("BROADCAST_MAX_USERS") or "10000").strip() or "10000")
+    lim = max(1, min(lim, 50_000))
+    out: list[int] = []
+    try:
+        res = (
+            supabase.table("users")
+            .select("telegram_id")
+            .order("telegram_id", desc=False)
+            .limit(lim)
+            .execute()
+        )
+        for row in res.data or []:
+            tid = row.get("telegram_id")
+            if tid is None:
+                continue
+            try:
+                out.append(int(tid))
+            except (TypeError, ValueError):
+                pass
+    except Exception as e:
+        print(f"users broadcast ids: {e}")
+    return out
+
+
 def user_get(tid: int):
     r = supabase.table("users").select("*").eq("telegram_id", tid).execute()
     return r.data[0] if r.data else None
+
+
+def get_user_referral_balance_adjustment_usd(tid: int) -> float:
+    """Админская корректировка к формуле «доступно к выводу» (начисления − списания + корр.)."""
+    u = user_get(tid)
+    if not u:
+        return 0.0
+    raw = u.get("referral_balance_adjustment_usd")
+    if raw is None:
+        return 0.0
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def set_user_referral_balance_adjustment_usd(tid: int, adjustment: float) -> None:
+    adjustment = max(-1e9, min(1e9, float(adjustment)))
+    u = user_get(tid)
+    if not u:
+        raise ValueError("Пользователь не найден в users")
+    supabase.table("users").update({"referral_balance_adjustment_usd": adjustment}).eq(
+        "telegram_id", tid
+    ).execute()
 
 
 def verify_crypto_pay_webhook_signature(body_text: str, signature_header: str, api_token: str) -> bool:
@@ -485,6 +540,41 @@ def set_referral_percent(pct: float) -> None:
     supabase.table("app_settings").upsert(
         {"key": "referral_percent", "value": str(pct)}
     ).execute()
+
+
+def get_referral_min_withdraw_usd() -> float:
+    """Минимальная сумма вывода реферального баланса (USD-эквивалент)."""
+    try:
+        r = (
+            supabase.table("app_settings")
+            .select("value")
+            .eq("key", "referral_min_withdraw_usd")
+            .execute()
+        )
+        if r.data:
+            v = float(r.data[0]["value"])
+            return max(0.01, min(1_000_000.0, v))
+    except Exception as e:
+        print(f"app_settings referral_min_withdraw_usd: {e}")
+    return max(0.01, min(1_000_000.0, float(REFERRAL_MIN_WITHDRAW_USD)))
+
+
+def set_referral_min_withdraw_usd(amt: float) -> None:
+    amt = max(0.01, min(1_000_000.0, float(amt)))
+    supabase.table("app_settings").upsert(
+        {"key": "referral_min_withdraw_usd", "value": str(amt)}
+    ).execute()
+
+
+def referral_admin_settings_markdown() -> str:
+    pct = get_referral_percent()
+    m = get_referral_min_withdraw_usd()
+    return (
+        "🎁 **Реферальная программа**\n\n"
+        f"• Процент: **{pct:g}%** (с каждой оплаты приглашённого)\n"
+        f"• Минимум вывода реф. баланса: **{m:g}** USD\n\n"
+        "Выберите пресеты или «Свой %» / «Свой мин.»."
+    )
 
 
 def get_user_referral_percent(telegram_id: int) -> tuple[float, bool]:
@@ -767,24 +857,12 @@ def _parse_any_ts_to_unix(raw: Any) -> Optional[int]:
 
 
 async def referral_last_invite_ts(telegram_id: int) -> Optional[int]:
-    """Последний момент, когда у пользователя появился приглашённый."""
-    try:
-        r = (
-            supabase.table("users")
-            .select("created_at")
-            .eq("referred_by", telegram_id)
-            .order("created_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-        if r.data:
-            ts = _parse_any_ts_to_unix(r.data[0].get("created_at"))
-            if ts:
-                return ts
-    except Exception as e:
-        print(f"users last invite ts read failed for {telegram_id}: {e}")
+    """Момент последней «активности» по рефералке для правила сгорания.
 
-    # Fallback, если нет/нечитаем created_at в users.
+    Используется время последнего начисления в referral_rewards (есть created_at).
+    Запрос к users.created_at не делаем: в вашей схеме колонки может не быть (42703).
+    Если позже добавите created_at у приглашённых — можно расширить логику.
+    """
     try:
         rr = (
             supabase.table("referral_rewards")
@@ -802,7 +880,7 @@ async def referral_last_invite_ts(telegram_id: int) -> Optional[int]:
 
 
 async def maybe_burn_inactive_referral_balance(telegram_id: int) -> float:
-    """Сжигает доступный реферальный баланс при отсутствии новых приглашённых."""
+    """Сжигает баланс, если давно не было новых начислений рефералки (см. referral_last_invite_ts)."""
     inactive_days = max(1, int(REFERRAL_BURN_INACTIVE_DAYS))
     last_invite_ts = await referral_last_invite_ts(telegram_id)
     if not last_invite_ts:
@@ -813,7 +891,8 @@ async def maybe_burn_inactive_referral_balance(telegram_id: int) -> float:
 
     earned = await referral_rewards_total_usd(telegram_id)
     withdrawn = await referral_withdrawals_total_usd(telegram_id)
-    available = max(0.0, earned - withdrawn)
+    adj = get_user_referral_balance_adjustment_usd(telegram_id)
+    available = max(0.0, earned - withdrawn + adj)
     if available <= 1e-9:
         return 0.0
 
@@ -837,7 +916,7 @@ async def maybe_burn_inactive_referral_balance(telegram_id: int) -> float:
         try:
             await bot.send_message(
                 telegram_id,
-                "⚠️ Реферальный баланс сгорел: не было новых приглашённых более "
+                "⚠️ Реферальный баланс сгорел: не было новых начислений рефералки более "
                 f"{inactive_days} дней.\n"
                 f"Списано: `{amt:.6f}` USDT (эквивалент).",
                 parse_mode="Markdown",
@@ -851,7 +930,8 @@ async def referral_available_usd(telegram_id: int) -> float:
     await maybe_burn_inactive_referral_balance(telegram_id)
     earned = await referral_rewards_total_usd(telegram_id)
     withdrawn = await referral_withdrawals_total_usd(telegram_id)
-    return max(0.0, earned - withdrawn)
+    adj = get_user_referral_balance_adjustment_usd(telegram_id)
+    return max(0.0, earned - withdrawn + adj)
 
 
 async def crypto_pay_create_check_usdt(
@@ -912,6 +992,10 @@ def build_user_card_text(tid: int, u: dict) -> str:
     un = esc_html(u.get("username") or "—")
     ref_pct, is_override = get_user_referral_percent(tid)
     ref_src = "персональный" if is_override else "по умолчанию"
+    bal_adj = get_user_referral_balance_adjustment_usd(tid)
+    bal_line = ""
+    if abs(bal_adj) > 1e-9:
+        bal_line = f"• Корр. реф. вывода: <b>{bal_adj:+.2f}</b> USD\n"
     return (
         f"👤 <b>Пользователь</b>\n\n"
         f"• ID: <code>{tid}</code>\n"
@@ -919,6 +1003,7 @@ def build_user_card_text(tid: int, u: dict) -> str:
         f"• Подписка: <b>{esc_html(status)}</b>\n"
         f"• До (UTC): {esc_html(fmt_ts(sub))}\n"
         f"• Реф. %: <b>{ref_pct:g}%</b> ({ref_src})\n"
+        f"{bal_line}"
         f"• HWID:\n{hw_show}\n"
     )
 
@@ -943,6 +1028,7 @@ def kb_main_admin():
         inline_keyboard=[
             [InlineKeyboardButton(text="📋 Все пользователи", callback_data=f"{CB}:list:0")],
             [InlineKeyboardButton(text="🎁 Реферальный %", callback_data=f"{CB}:refpct")],
+            [InlineKeyboardButton(text="📢 Рассылка", callback_data=f"{CB}:broadcast")],
             [InlineKeyboardButton(text="ℹ️ Справка", callback_data=f"{CB}:help")],
         ]
     )
@@ -959,6 +1045,15 @@ def kb_referral_admin():
             [
                 InlineKeyboardButton(text="20%", callback_data=f"{CB}:refset:20"),
                 InlineKeyboardButton(text="Свой %", callback_data=f"{CB}:refcust"),
+            ],
+            [
+                InlineKeyboardButton(text="$5 вывод", callback_data=f"{CB_REF_MIN}:5"),
+                InlineKeyboardButton(text="$10", callback_data=f"{CB_REF_MIN}:10"),
+                InlineKeyboardButton(text="$25", callback_data=f"{CB_REF_MIN}:25"),
+            ],
+            [
+                InlineKeyboardButton(text="$50", callback_data=f"{CB_REF_MIN}:50"),
+                InlineKeyboardButton(text="💸 Свой мин.", callback_data=f"{CB}:rwmincust"),
             ],
             [InlineKeyboardButton(text="⬅️ Админ-меню", callback_data=f"{CB}:menu")],
         ]
@@ -982,7 +1077,11 @@ def kb_user_actions(tid: int):
             ],
             [
                 InlineKeyboardButton(text="🎁 Реф. %", callback_data=f"{CB}:urp:{tid}"),
-                InlineKeyboardButton(text="♻️ По умолчанию", callback_data=f"{CB}:urc:{tid}"),
+                InlineKeyboardButton(text="♻️ % дефолт", callback_data=f"{CB}:urc:{tid}"),
+            ],
+            [
+                InlineKeyboardButton(text="💰 Реф. баланс", callback_data=f"{CB}:urb:{tid}"),
+                InlineKeyboardButton(text="↩️ Корр. 0", callback_data=f"{CB}:urbr:{tid}"),
             ],
             [InlineKeyboardButton(text="⬅️ К списку", callback_data=f"{CB}:list:0")],
             [InlineKeyboardButton(text="🏠 Админ-меню", callback_data=f"{CB}:menu")],
@@ -2521,8 +2620,8 @@ async def build_referrals_user_html(uid: int) -> str:
     lines += [
         "",
         f"Доступно к выводу (≈USD): <b>{avail:.2f}</b>",
-        f"Минимум вывода: <b>{REFERRAL_MIN_WITHDRAW_USD:g}</b> USD (чек в USDT).",
-        f"Если новых приглашённых нет более <b>{max(1, REFERRAL_BURN_INACTIVE_DAYS)}</b> дней — баланс сгорает.",
+        f"Минимум вывода: <b>{get_referral_min_withdraw_usd():g}</b> USD (чек в USDT).",
+        f"Если новых начислений рефералки не было более <b>{max(1, REFERRAL_BURN_INACTIVE_DAYS)}</b> дней — баланс сгорает.",
     ]
     return "\n".join(lines)
 
@@ -2546,9 +2645,10 @@ async def cb_user_referral_withdraw_start(query: CallbackQuery, state: FSMContex
         return
     tid = query.from_user.id
     avail = await referral_available_usd(tid)
-    if avail + 1e-9 < REFERRAL_MIN_WITHDRAW_USD:
+    min_w = get_referral_min_withdraw_usd()
+    if avail + 1e-9 < min_w:
         await query.answer(
-            f"Недостаточно средств. Минимум {REFERRAL_MIN_WITHDRAW_USD:g} USD, доступно {avail:.2f} USD.",
+            f"Недостаточно средств. Минимум {min_w:g} USD, доступно {avail:.2f} USD.",
             show_alert=True,
         )
         return
@@ -2556,7 +2656,7 @@ async def cb_user_referral_withdraw_start(query: CallbackQuery, state: FSMContex
     await safe_edit_text(query.message,
         "💸 <b>Вывод реферального баланса</b>\n\n"
         f"Доступно: <b>{avail:.2f}</b> USD (эквивалент).\n"
-        f"Минимум: <b>{REFERRAL_MIN_WITHDRAW_USD:g}</b> USD.\n\n"
+        f"Минимум: <b>{get_referral_min_withdraw_usd():g}</b> USD.\n\n"
         "Введите сумму вывода в долларах (например <code>10</code> или <code>25.5</code>).\n"
         "Чек будет в <b>USDT</b> и привязан к вашему Telegram.\n\n"
         "/cancel — отменить.",
@@ -2591,9 +2691,10 @@ async def process_referral_withdraw_amount(message: Message, state: FSMContext):
             parse_mode="HTML",
         )
         return
-    if amt < REFERRAL_MIN_WITHDRAW_USD - 1e-9:
+    min_w = get_referral_min_withdraw_usd()
+    if amt < min_w - 1e-9:
         await message.answer(
-            f"Минимальная сумма вывода — <b>{REFERRAL_MIN_WITHDRAW_USD:g}</b> USD.",
+            f"Минимальная сумма вывода — <b>{min_w:g}</b> USD.",
             parse_mode="HTML",
         )
         return
@@ -2672,7 +2773,8 @@ async def cmd_admin(message: Message, state: FSMContext):
         "🔐 **Админ-панель Neuro Uploader**\n\n"
         "• Просмотр пользователей и подписок\n"
         "• Изменение срока подписки\n"
-        "• Сброс и ручная установка HWID\n\n"
+        "• Сброс и ручная установка HWID\n"
+        "• Рассылка всем пользователям из базы\n\n"
         "Команды: `/add ID дней`, `/reset ID`\n"
         "Файлы после оплаты: `/set_app_zip` → затем отправьте zip; `/set_app_txt` → затем txt.",
         parse_mode="Markdown",
@@ -2787,6 +2889,108 @@ async def cb_noop(query: CallbackQuery):
     await query.answer()
 
 
+@dp.callback_query(F.data == f"{CB}:broadcast")
+async def cb_broadcast_start(query: CallbackQuery, state: FSMContext):
+    if not is_admin(query.from_user.id):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(AdminStates.broadcast_wait)
+    lim = int((os.environ.get("BROADCAST_MAX_USERS") or "10000").strip() or "10000")
+    lim = max(1, min(lim, 50_000))
+    await query.message.answer(
+        "📢 **Рассылка**\n\n"
+        "Отправьте **следующим сообщением** то, что получат пользователи из базы "
+        f"(до **{lim}** записей в `users`). Подойдёт текст, фото с подписью, документ — "
+        "можно **переслать** сообщение.\n\n"
+        "Отправка идёт через копирование сообщения, формат сохраняется.\n\n"
+        "/cancel — отмена.",
+        parse_mode="Markdown",
+    )
+    await query.answer()
+
+
+@dp.message(AdminStates.broadcast_wait)
+async def admin_broadcast_capture(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    if message.text and message.text.strip().startswith("/"):
+        if message.text.strip().split()[0] in ("/cancel",):
+            await state.clear()
+            await message.answer("Отменено.", reply_markup=kb_main_admin())
+        else:
+            await message.answer(
+                "Сейчас режим рассылки. Отправьте сообщение для рассылки или **/cancel**.",
+                parse_mode="Markdown",
+            )
+        return
+    await state.update_data(bc_from_chat=message.chat.id, bc_message_id=message.message_id)
+    await state.set_state(AdminStates.broadcast_confirm)
+    n = len(users_telegram_ids_for_broadcast())
+    await message.answer(
+        f"Сообщение принято. Получателей в выборке: **{n}**.\n\nОтправить всем?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Отправить всем", callback_data=f"{CB}:bc_ok")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data=f"{CB}:bc_no")],
+            ]
+        ),
+    )
+
+
+@dp.callback_query(F.data == f"{CB}:bc_no", StateFilter(AdminStates.broadcast_confirm))
+async def cb_broadcast_cancel(query: CallbackQuery, state: FSMContext):
+    if not is_admin(query.from_user.id):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    await query.answer("Отменено")
+    await query.message.edit_text("Рассылка отменена.")
+
+
+@dp.callback_query(F.data == f"{CB}:bc_ok", StateFilter(AdminStates.broadcast_confirm))
+async def cb_broadcast_run(query: CallbackQuery, state: FSMContext):
+    if not is_admin(query.from_user.id):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    if not bot:
+        await state.clear()
+        await query.answer("Бот недоступен", show_alert=True)
+        return
+    data = await state.get_data()
+    from_chat = data.get("bc_from_chat")
+    msg_id = data.get("bc_message_id")
+    if not from_chat or not msg_id:
+        await state.clear()
+        await query.answer("Нет данных — начните снова", show_alert=True)
+        return
+    await query.answer("Отправляем…")
+    await state.clear()
+    ids = users_telegram_ids_for_broadcast()
+    ok = fail = 0
+    delay = float((os.environ.get("BROADCAST_SEND_DELAY_SEC") or "0.04").strip() or "0.04")
+    delay = max(0.02, min(delay, 2.0))
+    for uid in ids:
+        try:
+            await bot.copy_message(chat_id=uid, from_chat_id=from_chat, message_id=msg_id)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            if fail <= 5:
+                print(f"broadcast to {uid}: {e}")
+        await asyncio.sleep(delay)
+    await query.message.answer(
+        "✅ **Рассылка завершена**\n\n"
+        f"• Успешно: **{ok}**\n"
+        f"• Ошибок: **{fail}** (часто — пользователь не нажимал /start или заблокировал бота)\n"
+        f"• В выборке: **{len(ids)}**",
+        parse_mode="Markdown",
+        reply_markup=kb_main_admin(),
+    )
+
+
 @dp.callback_query(F.data == f"{CB}:menu")
 async def cb_menu(query: CallbackQuery, state: FSMContext):
     if not is_admin(query.from_user.id):
@@ -2813,7 +3017,9 @@ async def cb_help(query: CallbackQuery):
         "• **Свой срок** — введите число **дней** (можно `0` — сразу истекает).\n"
         "• **Сброс HWID** — пользователь сможет войти с нового ПК.\n"
         "• **Задать HWID** — вставьте **64-символьный** hex (как в приложении).\n"
-        "• **Реферальный %** — доля с каждой оплаты приглашённого.\n\n"
+        "• **Реферальный %** — доля с каждой оплаты приглашённого; там же **мин. вывод** реф. баланса.\n"
+        "• **Реф. баланс** в карточке пользователя — задать **доступную к выводу** сумму (USD).\n"
+        "• **Рассылка** — одно сообщение всем из `users` (копирование: текст, фото, документ и т.д.).\n\n"
         "/cancel — отменить ввод.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(
@@ -2829,11 +3035,8 @@ async def cb_admin_referral_menu(query: CallbackQuery, state: FSMContext):
         await query.answer("Нет доступа", show_alert=True)
         return
     await state.clear()
-    pct = get_referral_percent()
     await safe_edit_text(query.message,
-        f"🎁 **Реферальный процент**\n\n"
-        f"Сейчас: **{pct:g}%** с каждой оплаты приглашённого.\n\n"
-        "Выберите значение или «Свой %».",
+        referral_admin_settings_markdown(),
         parse_mode="Markdown",
         reply_markup=kb_referral_admin(),
     )
@@ -2857,11 +3060,48 @@ async def cb_admin_referral_set(query: CallbackQuery):
     set_referral_percent(pct)
     await query.answer(f"Установлено {pct:g}%")
     await safe_edit_text(query.message,
-        f"🎁 **Реферальный процент**\n\n"
-        f"Сейчас: **{pct:g}%**",
+        referral_admin_settings_markdown(),
         parse_mode="Markdown",
         reply_markup=kb_referral_admin(),
     )
+
+
+@dp.callback_query(F.data.startswith(f"{CB_REF_MIN}:"))
+async def cb_admin_referral_min_preset(query: CallbackQuery):
+    if not is_admin(query.from_user.id):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    parts = (query.data or "").split(":")
+    if len(parts) < 3:
+        await query.answer("Ошибка")
+        return
+    try:
+        amt = float(":".join(parts[2:]))
+    except ValueError:
+        await query.answer("Ошибка")
+        return
+    set_referral_min_withdraw_usd(amt)
+    await query.answer(f"Мин. вывод {amt:g} USD")
+    await safe_edit_text(query.message,
+        referral_admin_settings_markdown(),
+        parse_mode="Markdown",
+        reply_markup=kb_referral_admin(),
+    )
+
+
+@dp.callback_query(F.data == f"{CB}:rwmincust")
+async def cb_admin_referral_min_custom(query: CallbackQuery, state: FSMContext):
+    if not is_admin(query.from_user.id):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    await state.set_state(AdminStates.referral_min_withdraw)
+    await query.message.answer(
+        "Введите **минимум вывода** реферального баланса в **USD** "
+        f"(сейчас **{get_referral_min_withdraw_usd():g}**), например `10` или `25.5`.\n"
+        "Допустимо от **0.01** до **1 000 000**.\n/cancel — отмена.",
+        parse_mode="Markdown",
+    )
+    await query.answer()
 
 
 @dp.callback_query(F.data == f"{CB}:refcust")
@@ -3103,6 +3343,98 @@ async def cb_user_referral_percent_clear(query: CallbackQuery, state: FSMContext
     await edit_user_card(query, tid, "♻️ Возвращён % по умолчанию")
 
 
+@dp.callback_query(F.data.startswith(f"{CB}:urb:"))
+async def cb_user_referral_balance_prompt(query: CallbackQuery, state: FSMContext):
+    if not is_admin(query.from_user.id):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        tid = int(query.data.split(":")[2])
+    except (IndexError, ValueError):
+        await query.answer("Ошибка ID")
+        return
+    if not user_get(tid):
+        await query.answer("Пользователя нет в users", show_alert=True)
+        return
+    earned = await referral_rewards_total_usd(tid)
+    withdrawn = await referral_withdrawals_total_usd(tid)
+    adj = get_user_referral_balance_adjustment_usd(tid)
+    base = earned - withdrawn
+    cur_avail = max(0.0, base + adj)
+    await state.set_state(AdminStates.referral_balance_set)
+    await state.update_data(telegram_id=tid)
+    await query.message.answer(
+        f"Укажите **сумму в USD, доступную к выводу** для `{tid}` (как увидит рефовод).\n\n"
+        f"Сейчас: **{cur_avail:.2f}** USD  "
+        f"(из начислений и выводов: **{base:.2f}**, корр.: **{adj:+.2f}**).\n\n"
+        "**0** — цель «доступно к выводу» = 0 USD.\n"
+        "Сбросить только корректировку (вернуться к сумме из начислений и выводов) — **↩️ Корр. 0** в карточке.\n\n"
+        "/cancel — отмена.",
+        parse_mode="Markdown",
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data.startswith(f"{CB}:urbr:"))
+async def cb_user_referral_balance_adjustment_reset(query: CallbackQuery, state: FSMContext):
+    if not is_admin(query.from_user.id):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    try:
+        tid = int(query.data.split(":")[2])
+    except (IndexError, ValueError):
+        await query.answer("Ошибка ID")
+        return
+    if not user_get(tid):
+        await query.answer("Пользователя нет в users", show_alert=True)
+        return
+    try:
+        set_user_referral_balance_adjustment_usd(tid, 0.0)
+    except Exception as e:
+        await query.answer(str(e), show_alert=True)
+        return
+    await edit_user_card(query, tid, "↩️ Корректировка реф. баланса = 0")
+
+
+@dp.message(AdminStates.referral_balance_set, F.text)
+async def process_referral_balance_set(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    data = await state.get_data()
+    tid = data.get("telegram_id")
+    if not tid:
+        await state.clear()
+        await message.answer("Сессия сброшена. /admin")
+        return
+    raw = message.text.strip().replace(",", ".")
+    try:
+        target = float(raw)
+    except ValueError:
+        await message.answer("Нужно число USD, например `100` или `25.5`.")
+        return
+    if target < 0 or target > 10_000_000:
+        await message.answer("Допустимо 0 … 10 000 000 USD.")
+        return
+    try:
+        earned = await referral_rewards_total_usd(int(tid))
+        withdrawn = await referral_withdrawals_total_usd(int(tid))
+        adj = target - (earned - withdrawn)
+        set_user_referral_balance_adjustment_usd(int(tid), adj)
+    except Exception as e:
+        await message.answer(f"Ошибка: {e}")
+        return
+    shown = max(0.0, earned - withdrawn + adj)
+    await state.clear()
+    await message.answer(
+        f"✅ Пользователь `{tid}`: **доступно к выводу {shown:.2f}** USD.\n"
+        f"Корректировка к базе: **{adj:+.2f}** USD.",
+        parse_mode="Markdown",
+        reply_markup=kb_main_admin(),
+    )
+
+
 @dp.message(AdminStates.hwid_value, F.text)
 async def process_hwid(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -3184,6 +3516,33 @@ async def process_referral_percent_input(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
         f"✅ Процент реферальной программы: **{pct:g}%**",
+        parse_mode="Markdown",
+        reply_markup=kb_main_admin(),
+    )
+
+
+@dp.message(AdminStates.referral_min_withdraw, F.text)
+async def process_referral_min_withdraw_input(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    raw = message.text.strip().replace(",", ".")
+    try:
+        amt = float(raw)
+    except ValueError:
+        await message.answer("Нужно число (USD), например `10` или `12.5`.")
+        return
+    if amt < 0.01 or amt > 1_000_000:
+        await message.answer("Допустимо 0.01 … 1 000 000 USD.")
+        return
+    try:
+        set_referral_min_withdraw_usd(amt)
+    except Exception as e:
+        await message.answer(f"Не удалось сохранить: {e}")
+        return
+    await state.clear()
+    await message.answer(
+        f"✅ Минимальная сумма вывода рефералов: **{get_referral_min_withdraw_usd():g}** USD",
         parse_mode="Markdown",
         reply_markup=kb_main_admin(),
     )
