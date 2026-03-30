@@ -1515,10 +1515,12 @@ async def show_user_main_menu(bot_obj: Optional[Bot], chat_id: int, *, extra_cap
             return
         except Exception as e:
             print(f"main menu send_document failed: {e}")
+    # Telegram не принимает пустой текст и часто отклоняет сообщение из одних пробелов.
+    fallback_text = extra_caption if extra_caption else "\u00a0"
     await bot_obj.send_message(
         chat_id=chat_id,
-        text=extra_caption or " ",
-        parse_mode="Markdown",
+        text=fallback_text,
+        parse_mode="Markdown" if extra_caption else None,
         reply_markup=kb_user_main_menu(),
     )
 
