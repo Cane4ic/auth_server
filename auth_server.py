@@ -12,7 +12,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from hashlib import sha256
 from hmac import HMAC, compare_digest
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 import uvicorn
@@ -73,6 +73,7 @@ CRYPTO_PAY_TESTNET = (os.environ.get("CRYPTO_PAY_TESTNET") or "true").strip().lo
 )
 CRYPTO_PAY_ASSET = (os.environ.get("CRYPTO_PAY_ASSET") or "TON").strip().upper()
 REFERRAL_PERCENT_DEFAULT = float((os.environ.get("REFERRAL_PERCENT_DEFAULT") or "10").strip())
+REFERRAL_MIN_WITHDRAW_USD = float((os.environ.get("REFERRAL_MIN_WITHDRAW_USD") or "10").strip())
 
 # Прокси для десктопа Neuro Uploader: ключи не в клиенте, только на сервере (.env)
 SADCAPTCHA_LICENSE_KEY = (os.environ.get("SADCAPTCHA_LICENSE_KEY") or "").strip()
@@ -143,6 +144,10 @@ class AdminStates(StatesGroup):
     sub_days = State()
     hwid_value = State()
     referral_percent = State()
+
+
+class UserReferralWithdrawStates(StatesGroup):
+    amount = State()
 
 
 def is_admin(user_id: int) -> bool:
@@ -427,6 +432,153 @@ async def referral_process_paid_invoice(inv: dict, buyer_id: int, is_renewal_pri
             print(f"referral notify referrer {ref_uid}: {e}")
 
 
+_EXCHANGE_RATES_CACHE: Optional[tuple[float, list]] = None
+
+
+async def crypto_pay_app_get(method: str, params: Optional[dict] = None) -> Any:
+    token = (os.environ.get("CRYPTO_PAY_API_TOKEN") or "").strip()
+    if not token:
+        raise ValueError("CRYPTO_PAY_API_TOKEN не задан")
+    base = "https://testnet-pay.crypt.bot" if CRYPTO_PAY_TESTNET else "https://pay.crypt.bot"
+    api_url = f"{base}/api/{method}"
+    headers = {"Crypto-Pay-API-Token": token}
+    clean = {k: v for k, v in (params or {}).items() if v is not None}
+    async with httpx.AsyncClient(timeout=45.0) as client:
+        r = await client.get(api_url, params=clean, headers=headers)
+    try:
+        data = r.json()
+    except Exception:
+        raise ValueError(f"Crypto Pay: ответ не JSON (HTTP {r.status_code}).") from None
+    if not data.get("ok"):
+        err = data.get("error") or {}
+        name = err.get("name") or err.get("code") or str(data)
+        raise ValueError(f"Crypto Pay: {name}")
+    return data.get("result")
+
+
+async def crypto_pay_fetch_exchange_rates() -> list:
+    try:
+        res = await crypto_pay_app_get("getExchangeRates")
+    except ValueError as e:
+        print(f"getExchangeRates: {e}")
+        return []
+    if isinstance(res, list):
+        return res
+    if isinstance(res, dict) and "items" in res:
+        return res["items"]
+    return []
+
+
+async def crypto_pay_get_exchange_rates_cached() -> list:
+    global _EXCHANGE_RATES_CACHE
+    now = time.time()
+    if _EXCHANGE_RATES_CACHE and now - _EXCHANGE_RATES_CACHE[0] < 60:
+        return _EXCHANGE_RATES_CACHE[1]
+    rates = await crypto_pay_fetch_exchange_rates()
+    _EXCHANGE_RATES_CACHE = (now, rates)
+    return rates
+
+
+def asset_amount_to_usd(asset: str, amount: float, rates: list) -> float:
+    asset = str(asset or "").strip().upper()
+    if asset in ("USDT", "USD", "BUSD", "USDC"):
+        return amount
+    if amount <= 0:
+        return 0.0
+    for r in rates:
+        if not r:
+            continue
+        if r.get("is_valid") is False:
+            continue
+        src = str(r.get("source", "")).upper()
+        tgt = str(r.get("target", "")).upper()
+        try:
+            rt = float(r.get("rate") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not rt:
+            continue
+        if src == asset and tgt in ("USD", "USDT"):
+            return amount * rt
+        if tgt == asset and src in ("USD", "USDT"):
+            return amount / rt
+    return 0.0
+
+
+async def referral_rewards_total_usd(telegram_id: int) -> float:
+    rates = await crypto_pay_get_exchange_rates_cached()
+    try:
+        rr = (
+            supabase.table("referral_rewards")
+            .select("asset, reward_amount")
+            .eq("referrer_telegram_id", telegram_id)
+            .execute()
+        )
+    except Exception as e:
+        print(f"referral_rewards list: {e}")
+        return 0.0
+    total = 0.0
+    for row in rr.data or []:
+        a = str(row.get("asset") or "TON")
+        try:
+            amt = float(row.get("reward_amount") or 0)
+        except (TypeError, ValueError):
+            continue
+        total += asset_amount_to_usd(a, amt, rates)
+    return total
+
+
+async def referral_withdrawals_total_usd(telegram_id: int) -> float:
+    try:
+        r = (
+            supabase.table("referral_withdrawals")
+            .select("amount_usd")
+            .eq("telegram_id", telegram_id)
+            .execute()
+        )
+    except Exception as e:
+        print(f"referral_withdrawals sum: {e}")
+        return 0.0
+    s = 0.0
+    for row in r.data or []:
+        try:
+            s += float(row.get("amount_usd") or 0)
+        except (TypeError, ValueError):
+            pass
+    return s
+
+
+async def referral_available_usd(telegram_id: int) -> float:
+    earned = await referral_rewards_total_usd(telegram_id)
+    withdrawn = await referral_withdrawals_total_usd(telegram_id)
+    return max(0.0, earned - withdrawn)
+
+
+async def crypto_pay_create_check_usdt(
+    amount: float, pin_to_user_id: int
+) -> tuple[Optional[str], Optional[str], Optional[int]]:
+    amt_str = f"{amount:.8f}".rstrip("0").rstrip(".")
+    try:
+        res = await crypto_pay_app_get(
+            "createCheck",
+            {"asset": "USDT", "amount": amt_str, "pin_to_user_id": pin_to_user_id},
+        )
+    except ValueError as e:
+        return None, str(e), None
+    if not isinstance(res, dict):
+        return None, "Crypto Pay: пустой ответ createCheck", None
+    url = res.get("bot_check_url") or res.get("botCheckUrl")
+    cid = res.get("check_id")
+    if cid is not None:
+        try:
+            cid = int(cid)
+        except (TypeError, ValueError):
+            cid = None
+    if not url:
+        return None, "Crypto Pay не вернул ссылку на чек.", None
+    return str(url), None, cid
+
+
 def policies_user_has_accepted(telegram_id: int) -> bool:
     """Пользователь нажал «Принимаю» в боте (таблица policy_acceptances)."""
     try:
@@ -614,6 +766,23 @@ def kb_user_back_main():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ Главное меню", callback_data=f"{UCB}:main")],
+        ]
+    )
+
+
+def kb_referrals_screen():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💸 Вывести", callback_data=f"{UCB}:refw")],
+            [InlineKeyboardButton(text="⬅️ Главное меню", callback_data=f"{UCB}:main")],
+        ]
+    )
+
+
+def kb_referrals_withdraw_cancel():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"{UCB}:refw_cancel")],
         ]
     )
 
@@ -1376,7 +1545,8 @@ async def cb_user_channel_recheck(query: CallbackQuery):
 
 
 @dp.callback_query(F.data == f"{UCB}:main")
-async def cb_user_back_main(query: CallbackQuery):
+async def cb_user_back_main(query: CallbackQuery, state: FSMContext):
+    await state.clear()
     uid = query.from_user.id
     chat_id = query.message.chat.id
     if not is_admin(uid) and not policies_user_has_accepted(uid):
@@ -1781,6 +1951,12 @@ async def build_referrals_user_html(uid: int) -> str:
         lines += ["", f"Начислено всего: <b>{html.escape(', '.join(parts))}</b>"]
     else:
         lines += ["", "Начислений пока нет — поделитесь ссылкой."]
+    avail = await referral_available_usd(uid)
+    lines += [
+        "",
+        f"Доступно к выводу (≈USD): <b>{avail:.2f}</b>",
+        f"Минимум вывода: <b>{REFERRAL_MIN_WITHDRAW_USD:g}</b> USD (чек в USDT).",
+    ]
     return "\n".join(lines)
 
 
@@ -1792,9 +1968,111 @@ async def cb_user_referrals(query: CallbackQuery):
     await query.message.edit_text(
         text,
         parse_mode="HTML",
-        reply_markup=kb_user_back_main(),
+        reply_markup=kb_referrals_screen(),
     )
     await query.answer()
+
+
+@dp.callback_query(F.data == f"{UCB}:refw")
+async def cb_user_referral_withdraw_start(query: CallbackQuery, state: FSMContext):
+    if not await require_policies_or_block(query):
+        return
+    tid = query.from_user.id
+    avail = await referral_available_usd(tid)
+    if avail + 1e-9 < REFERRAL_MIN_WITHDRAW_USD:
+        await query.answer(
+            f"Недостаточно средств. Минимум {REFERRAL_MIN_WITHDRAW_USD:g} USD, доступно {avail:.2f} USD.",
+            show_alert=True,
+        )
+        return
+    await state.set_state(UserReferralWithdrawStates.amount)
+    await query.message.edit_text(
+        "💸 <b>Вывод реферального баланса</b>\n\n"
+        f"Доступно: <b>{avail:.2f}</b> USD (эквивалент).\n"
+        f"Минимум: <b>{REFERRAL_MIN_WITHDRAW_USD:g}</b> USD.\n\n"
+        "Введите сумму вывода в долларах (например <code>10</code> или <code>25.5</code>).\n"
+        "Чек будет в <b>USDT</b> и привязан к вашему Telegram.\n\n"
+        "/cancel — отменить.",
+        parse_mode="HTML",
+        reply_markup=kb_referrals_withdraw_cancel(),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == f"{UCB}:refw_cancel")
+async def cb_user_referral_withdraw_cancel(query: CallbackQuery, state: FSMContext):
+    if not await require_policies_or_block(query):
+        return
+    await state.clear()
+    text = await build_referrals_user_html(query.from_user.id)
+    await query.message.edit_text(text, parse_mode="HTML", reply_markup=kb_referrals_screen())
+    await query.answer("Отменено.")
+
+
+@dp.message(UserReferralWithdrawStates.amount, F.text)
+async def process_referral_withdraw_amount(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    if not is_admin(uid) and not policies_user_has_accepted(uid):
+        await state.clear()
+        return
+    raw = (message.text or "").strip().replace(",", ".")
+    try:
+        amt = float(raw)
+    except ValueError:
+        await message.answer(
+            "Введите число, например <code>10</code> или <code>25.5</code>.",
+            parse_mode="HTML",
+        )
+        return
+    if amt < REFERRAL_MIN_WITHDRAW_USD - 1e-9:
+        await message.answer(
+            f"Минимальная сумма вывода — <b>{REFERRAL_MIN_WITHDRAW_USD:g}</b> USD.",
+            parse_mode="HTML",
+        )
+        return
+    if amt <= 0:
+        await message.answer("Сумма должна быть больше нуля.", parse_mode="HTML")
+        return
+    avail = await referral_available_usd(uid)
+    if amt > avail + 1e-6:
+        await message.answer(
+            f"Недостаточно средств. Доступно: <b>{avail:.2f}</b> USD.",
+            parse_mode="HTML",
+        )
+        return
+    url, err, check_id = await crypto_pay_create_check_usdt(amt, uid)
+    if err or not url:
+        await message.answer(esc_html(err or "Не удалось создать чек."), parse_mode="HTML")
+        return
+    now = int(time.time())
+    try:
+        supabase.table("referral_withdrawals").insert(
+            {
+                "telegram_id": uid,
+                "amount_usd": amt,
+                "asset": "USDT",
+                "check_id": check_id,
+                "bot_check_url": url,
+                "created_at": now,
+            }
+        ).execute()
+    except Exception as e:
+        print(f"referral_withdrawals insert failed: {e}")
+        await message.answer(
+            "Чек создан в Crypto Pay, но запись в базе не сохранилась. Обратитесь в поддержку.\n"
+            f'<a href="{html.escape(url, quote=True)}">Открыть чек</a>',
+            parse_mode="HTML",
+        )
+        await state.clear()
+        return
+    await state.clear()
+    await message.answer(
+        "✅ <b>Чек готов</b>\n\n"
+        f"Сумма: <b>{amt:.2f}</b> USD (USDT).\n"
+        f'<a href="{html.escape(url, quote=True)}">Открыть чек в Crypto Bot</a>',
+        parse_mode="HTML",
+        reply_markup=kb_referrals_screen(),
+    )
 
 
 @dp.callback_query(F.data == f"{UCB}:support")
@@ -1836,6 +2114,16 @@ async def cmd_admin(message: Message, state: FSMContext):
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
+    current = await state.get_state()
+    if current == UserReferralWithdrawStates.amount:
+        await state.clear()
+        text = await build_referrals_user_html(message.from_user.id)
+        await message.answer(
+            "<i>Отменено.</i>\n\n" + text,
+            parse_mode="HTML",
+            reply_markup=kb_referrals_screen(),
+        )
+        return
     if not is_admin(message.from_user.id):
         return
     await state.clear()
