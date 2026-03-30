@@ -202,6 +202,7 @@ class AdminStates(StatesGroup):
     referral_percent = State()
     referral_balance_set = State()
     referral_min_withdraw = State()
+    tariff_plan_text = State()
     app_zip_wait = State()
     app_txt_wait = State()
     broadcast_wait = State()
@@ -1066,9 +1067,21 @@ def kb_main_admin():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📋 Все пользователи", callback_data=f"{CB}:list:0")],
+            [InlineKeyboardButton(text="💳 Описания тарифов", callback_data=f"{CB}:tpl")],
             [InlineKeyboardButton(text="🎁 Реферальный %", callback_data=f"{CB}:refpct")],
             [InlineKeyboardButton(text="📢 Рассылка", callback_data=f"{CB}:broadcast")],
             [InlineKeyboardButton(text="ℹ️ Справка", callback_data=f"{CB}:help")],
+        ]
+    )
+
+
+def kb_admin_tariff_plans():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="STANDART", callback_data=f"{CB}:tpe:s")],
+            [InlineKeyboardButton(text="PRO", callback_data=f"{CB}:tpe:p")],
+            [InlineKeyboardButton(text="MAX", callback_data=f"{CB}:tpe:m")],
+            [InlineKeyboardButton(text="⬅️ Админ-меню", callback_data=f"{CB}:menu")],
         ]
     )
 
@@ -1844,6 +1857,15 @@ def app_setting_upsert_value(key: str, value: str) -> None:
         raise
 
 
+def app_setting_delete_key(key: str) -> None:
+    """Удалить ключ из app_settings (сброс к .env / дефолтам)."""
+    try:
+        supabase.table("app_settings").delete().eq("key", key).execute()
+    except Exception as e:
+        print(f"app_settings delete {key} failed: {e}")
+        raise
+
+
 def get_app_zip_file_id() -> Optional[str]:
     return APP_ZIP_FILE_ID or app_setting_get_value("app_zip_file_id")
 
@@ -2454,6 +2476,12 @@ _TARIFF_PLAN_ENV = {
     "p": "TEXT_PLAN_PRO",
     "m": "TEXT_PLAN_MAX",
 }
+# app_settings: полный HTML карточки тарифа (приоритет над TEXT_PLAN_* и _TARIFF_PLAN_DEFAULT).
+_TARIFF_PLAN_SETTINGS_KEYS = {
+    "s": "tariff_plan_html_s",
+    "p": "tariff_plan_html_p",
+    "m": "tariff_plan_html_m",
+}
 _TARIFF_PLAN_DEFAULT = {
     "s": (
         "<b>STANDART</b>\n\n"
@@ -2497,6 +2525,11 @@ _TARIFF_PLAN_DEFAULT = {
 def tariff_plan_body_html(code: str) -> str:
     if code not in _TARIFF_PLAN_ENV:
         return ""
+    db_key = _TARIFF_PLAN_SETTINGS_KEYS.get(code)
+    if db_key:
+        raw = app_setting_get_value(db_key)
+        if raw is not None and raw.strip():
+            return raw.strip()
     env_key = _TARIFF_PLAN_ENV[code]
     return (os.environ.get(env_key) or "").strip() or _TARIFF_PLAN_DEFAULT[code]
 
@@ -3190,6 +3223,7 @@ async def cb_help(query: CallbackQuery):
         "• **Задать HWID** — вставьте **64-символьный** hex (как в приложении).\n"
         "• **Реферальный %** — доля с каждой оплаты приглашённого; там же **мин. вывод** реф. баланса.\n"
         "• **Реф. баланс** в карточке пользователя — задать **доступную к выводу** сумму (USD).\n"
+        "• **Описания тарифов** — HTML карточки STANDART/PRO/MAX (цены в тексте); списание в Crypto Pay — .env.\n"
         "• **Рассылка** — одно сообщение всем из `users` (копирование: текст, фото, документ и т.д.).\n\n"
         "/cancel — отменить ввод.",
         parse_mode="Markdown",
@@ -3198,6 +3232,140 @@ async def cb_help(query: CallbackQuery):
         ),
     )
     await query.answer()
+
+
+@dp.callback_query(F.data == f"{CB}:tpl")
+async def cb_admin_tariff_plans_menu(query: CallbackQuery, state: FSMContext):
+    if not is_admin(query.from_user.id):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    intro = (
+        "💳 <b>Описания тарифов</b>\n\n"
+        "Текст карточки тарифа в боте — <b>HTML</b> (как в коде: <code>&lt;b&gt;</code>, "
+        "<code>&lt;i&gt;</code>, списки). "
+        "Цены в карточке задаёте в тексте; реальная сумма списания в Crypto Pay — переменные "
+        "<code>CRYPTO_PAY_*</code> на сервере.\n\n"
+        "Выберите тариф:"
+    )
+    await safe_edit_text(
+        query.message,
+        intro,
+        parse_mode="HTML",
+        reply_markup=kb_admin_tariff_plans(),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data.startswith(f"{CB}:tpe:"))
+async def cb_admin_tariff_plan_edit_start(query: CallbackQuery, state: FSMContext):
+    if not is_admin(query.from_user.id):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    parts = (query.data or "").split(":")
+    if len(parts) < 3:
+        await query.answer("Ошибка")
+        return
+    code = parts[-1]
+    if code not in _TARIFF_PLAN_ENV:
+        await query.answer()
+        return
+    label = _PLAN_INVOICE_LABEL.get(code, code.upper())
+    await state.set_state(AdminStates.tariff_plan_text)
+    await state.update_data(tariff_plan_code=code)
+    full = tariff_plan_body_html(code)
+    preview = esc_html(full[:4000]) + ("…" if len(full) > 4000 else "")
+    await safe_edit_text(
+        query.message,
+        f"✏️ <b>{label}</b>\n\n"
+        "Отправьте <b>следующим сообщением</b> полный текст карточки в HTML.\n"
+        "Цены в карточке — только в тексте; списание в Crypto Pay отсюда не меняется.\n\n"
+        "/cancel — отмена.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="♻️ Сброс к .env/дефолту",
+                        callback_data=f"{CB}:tpr:{code}",
+                    )
+                ],
+                [InlineKeyboardButton(text="📋 К списку тарифов", callback_data=f"{CB}:tpl")],
+                [InlineKeyboardButton(text="⬅️ Админ-меню", callback_data=f"{CB}:menu")],
+            ]
+        ),
+    )
+    await query.message.answer(
+        f"<b>Текущий текст (превью, экранировано):</b>\n<pre>{preview}</pre>",
+        parse_mode="HTML",
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data.startswith(f"{CB}:tpr:"))
+async def cb_admin_tariff_plan_reset(query: CallbackQuery, state: FSMContext):
+    if not is_admin(query.from_user.id):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    code = (query.data or "").split(":")[-1]
+    if code not in _TARIFF_PLAN_SETTINGS_KEYS:
+        await query.answer()
+        return
+    try:
+        app_setting_delete_key(_TARIFF_PLAN_SETTINGS_KEYS[code])
+    except Exception:
+        await query.answer("Ошибка БД", show_alert=True)
+        return
+    await state.clear()
+    label = _PLAN_INVOICE_LABEL.get(code, code.upper())
+    await query.answer(f"Сброшено: {label}")
+    await safe_edit_text(
+        query.message,
+        "💳 <b>Описания тарифов</b>\n\n"
+        f"Для <b>{label}</b> снова используются <code>TEXT_PLAN_*</code> из окружения или встроенный дефолт.\n\n"
+        "Выберите тариф:",
+        parse_mode="HTML",
+        reply_markup=kb_admin_tariff_plans(),
+    )
+
+
+@dp.message(AdminStates.tariff_plan_text, F.text)
+async def process_admin_tariff_plan_text(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    data = await state.get_data()
+    code = data.get("tariff_plan_code")
+    if code not in _TARIFF_PLAN_SETTINGS_KEYS:
+        await state.clear()
+        return
+    raw = (message.text or "").strip()
+    if not raw:
+        await message.answer("Пустой текст не сохранён.")
+        return
+    if len(raw) > 12000:
+        await message.answer("Слишком длинно (макс. 12000 символов).")
+        return
+    key = _TARIFF_PLAN_SETTINGS_KEYS[code]
+    try:
+        app_setting_upsert_value(key, raw)
+    except Exception:
+        await message.answer("Не удалось сохранить в Supabase (app_settings).")
+        return
+    await state.clear()
+    label = _PLAN_INVOICE_LABEL.get(code, code.upper())
+    await message.answer(
+        f"✅ Описание тарифа <b>{label}</b> сохранено в базе.",
+        parse_mode="HTML",
+        reply_markup=kb_main_admin(),
+    )
+
+
+@dp.message(AdminStates.tariff_plan_text)
+async def process_admin_tariff_plan_text_other(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("Нужен текст одним сообщением (HTML). /cancel — отмена.")
 
 
 @dp.callback_query(F.data == f"{CB}:refpct")
