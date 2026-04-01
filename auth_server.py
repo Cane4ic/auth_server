@@ -1,6 +1,6 @@
 """
 Сервер авторизации + Telegram-бот Neuro Uploader.
-API для приложения + админ-панель в Telegram (только ADMIN_ID).
+API для приложения + админ-панель в Telegram (ADMIN_ID — один или несколько id через запятую).
 """
 import asyncio
 import html
@@ -44,12 +44,31 @@ from supabase import Client, create_client
 # НАСТРОЙКИ (ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ)
 # ==========================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
+
+
+def _parse_admin_ids_from_env() -> frozenset[int]:
+    """Один или несколько числовых Telegram user id: через запятую или пробел."""
+    raw = (os.environ.get("ADMIN_ID") or "").strip()
+    if not raw:
+        return frozenset()
+    out: set[int] = set()
+    for part in raw.replace(",", " ").split():
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except ValueError:
+            print(f"ВНИМАНИЕ: пропуск некорректного фрагмента ADMIN_ID: {part!r}")
+    return frozenset(out)
+
+
+ADMIN_IDS = _parse_admin_ids_from_env()
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-if not all([BOT_TOKEN, ADMIN_ID, SUPABASE_URL, SUPABASE_KEY]):
+if not all([BOT_TOKEN, ADMIN_IDS, SUPABASE_URL, SUPABASE_KEY]):
     print("ВНИМАНИЕ: Не все переменные окружения заданы (BOT_TOKEN, ADMIN_ID, SUPABASE_*)!")
 
 # Канал для обычного /start (авторизация по deep-link /start SESSION не затрагивается)
@@ -214,7 +233,7 @@ class UserReferralWithdrawStates(StatesGroup):
 
 
 def is_admin(user_id: int) -> bool:
-    return bool(ADMIN_ID) and user_id == ADMIN_ID
+    return user_id in ADMIN_IDS
 
 
 async def safe_edit_text(message: Message, text: str, **kwargs) -> None:
