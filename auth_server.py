@@ -441,6 +441,30 @@ def user_get(tid: int):
     return r.data[0] if r.data else None
 
 
+def format_telegram_username_for_db(telegram_id: int, username: Optional[str]) -> str:
+    """Как в complete_web_site_login_sync: @name или числовой id."""
+    return f"@{username}" if username else str(telegram_id)
+
+
+def ensure_user_row_from_bot(telegram_id: int, username: Optional[str] = None) -> None:
+    """Строка в users при первом показе главного меню (после канала и принятия политик)."""
+    un = format_telegram_username_for_db(telegram_id, username)
+    u = user_get(telegram_id)
+    if u:
+        if (u.get("username") or "") != un:
+            try:
+                supabase.table("users").update({"username": un}).eq("telegram_id", telegram_id).execute()
+            except Exception as e:
+                print(f"ensure_user_row_from_bot username update: {e}")
+        return
+    try:
+        supabase.table("users").insert(
+            {"telegram_id": telegram_id, "subscription_until": 0, "hwid": None, "username": un}
+        ).execute()
+    except Exception as e:
+        print(f"ensure_user_row_from_bot insert failed for {telegram_id}: {e!s}")
+
+
 def get_user_referral_balance_adjustment_usd(tid: int) -> float:
     """Админская корректировка к формуле «доступно к выводу» (начисления − списания + корр.)."""
     u = user_get(tid)
@@ -2039,8 +2063,19 @@ async def show_user_profile_screen(query: CallbackQuery) -> None:
     await safe_edit_text(query.message, text, parse_mode="HTML", reply_markup=markup)
 
 
-async def show_user_main_menu(bot_obj: Optional[Bot], chat_id: int, *, extra_caption: str = "") -> None:
-    """Главное меню: вместо текста — картинка (send_document) + inline-кнопки."""
+async def show_user_main_menu(
+    bot_obj: Optional[Bot],
+    chat_id: int,
+    *,
+    extra_caption: str = "",
+    telegram_user_id: Optional[int] = None,
+    telegram_username: Optional[str] = None,
+) -> None:
+    """Главное меню: вместо текста — картинка (send_document) + inline-кнопки.
+    При переданном telegram_user_id — запись в users (первый доступ после канала и политик)."""
+    # До проверки bot: иначе при BOT_TOKEN не задан insert в users не выполнялся бы.
+    if telegram_user_id is not None:
+        ensure_user_row_from_bot(telegram_user_id, telegram_username)
     if not bot_obj:
         return
     extra_caption = (extra_caption or "").strip()
@@ -2200,7 +2235,13 @@ async def cmd_start(message: Message):
         extra = ""
         if is_admin(uid):
             extra = "\n\n🔐 /admin — панель администратора."
-        await show_user_main_menu(bot, message.chat.id, extra_caption=extra or "")
+        await show_user_main_menu(
+            bot,
+            message.chat.id,
+            extra_caption=extra or "",
+            telegram_user_id=uid,
+            telegram_username=message.from_user.username if message.from_user else None,
+        )
         return
 
     session_id = args[1]
@@ -2338,7 +2379,13 @@ async def cb_policies_accept(query: CallbackQuery):
         await query.message.delete()
     except Exception:
         pass
-    await show_user_main_menu(query.bot, query.message.chat.id, extra_caption=extra or "")
+    await show_user_main_menu(
+        query.bot,
+        query.message.chat.id,
+        extra_caption=extra or "",
+        telegram_user_id=uid,
+        telegram_username=query.from_user.username if query.from_user else None,
+    )
     await query.answer("Доступ к боту открыт.")
 
 
@@ -2362,7 +2409,13 @@ async def cb_user_channel_recheck(query: CallbackQuery):
         await query.message.delete()
     except Exception:
         pass
-    await show_user_main_menu(query.bot, query.message.chat.id, extra_caption=extra or "")
+    await show_user_main_menu(
+        query.bot,
+        query.message.chat.id,
+        extra_caption=extra or "",
+        telegram_user_id=uid,
+        telegram_username=query.from_user.username if query.from_user else None,
+    )
     await query.answer("✅ Подписка подтверждена!")
 
 
@@ -2398,7 +2451,13 @@ async def cb_user_back_main(query: CallbackQuery, state: FSMContext):
         await query.message.delete()
     except Exception:
         pass
-    await show_user_main_menu(query.bot, chat_id, extra_caption=extra or "")
+    await show_user_main_menu(
+        query.bot,
+        chat_id,
+        extra_caption=extra or "",
+        telegram_user_id=uid,
+        telegram_username=query.from_user.username if query.from_user else None,
+    )
     await query.answer()
 
 
