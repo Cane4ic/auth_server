@@ -236,9 +236,11 @@ class UserReferralWithdrawStates(StatesGroup):
 
 
 class UserTeamStates(StatesGroup):
-    """Создание команды: название → число мест → оплата."""
+    """Создание команды: название → число мест → оплата; докупка мест; ввод ID участников."""
     name = State()
     seats_count = State()
+    add_seats_count = State()
+    add_member_id = State()
 
 
 def is_admin(user_id: int) -> bool:
@@ -536,6 +538,101 @@ def team_add_seats_paid(team_id: str, owner_telegram_id: int, seats: int) -> boo
     except Exception as e:
         print(f"teams update seats failed: {e}")
         return False
+
+
+def team_members_list(team_id: str) -> list[dict]:
+    try:
+        r = (
+            supabase.table("team_members")
+            .select("member_telegram_id, created_at")
+            .eq("team_id", team_id)
+            .order("created_at", desc=False)
+            .execute()
+        )
+        return list(r.data or [])
+    except Exception as e:
+        print(f"team_members list team_id={team_id}: {e}")
+        return []
+
+
+def team_members_count(team_id: str) -> int:
+    return len(team_members_list(team_id))
+
+
+def team_member_display_line(member_telegram_id: int) -> str:
+    u = user_get(member_telegram_id)
+    un = ""
+    if u:
+        un = (u.get("username") or "").strip()
+    if un:
+        if not un.startswith("@"):
+            un = "@" + un
+        return f"• <code>{member_telegram_id}</code> — {esc_html(un)}"
+    return f"• <code>{member_telegram_id}</code>"
+
+
+def format_team_dashboard_html(team: dict, owner_telegram_id: int) -> str:
+    seats = int(team.get("seats_purchased") or 0)
+    tid = str(team["id"])
+    members = team_members_list(tid)
+    n_mem = len(members)
+    name = esc_html(str(team.get("name") or "—"))
+    lines = [
+        "👥 <b>Команда</b>",
+        "",
+        f"Название: <b>{name}</b>",
+        f"Оплачено мест: <b>{seats}</b>",
+        f"Участников в списке: <b>{n_mem}</b> из <b>{seats}</b>",
+        "",
+    ]
+    if members:
+        lines.append("<b>Участники:</b>")
+        for row in members:
+            try:
+                mid = int(row.get("member_telegram_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if mid > 0:
+                lines.append(team_member_display_line(mid))
+    else:
+        lines.append("<i>Список пуст. Добавьте участников по их Telegram ID.</i>")
+    return "\n".join(lines)
+
+
+def team_try_add_member(
+    team_id: str,
+    owner_telegram_id: int,
+    member_telegram_id: int,
+    *,
+    occupied_slots: int,
+    seats_total: int,
+) -> tuple[bool, str]:
+    """occupied_slots — сколько участников уже в команде; seats_total из teams.seats_purchased."""
+    if member_telegram_id <= 0:
+        return False, "bad_id"
+    if member_telegram_id == owner_telegram_id:
+        return False, "owner"
+    t = team_get_by_owner(owner_telegram_id)
+    if not t or str(t.get("id")) != str(team_id):
+        return False, "not_owner"
+    if occupied_slots >= seats_total:
+        return False, "full"
+    now = int(time.time())
+    try:
+        supabase.table("team_members").insert(
+            {
+                "team_id": team_id,
+                "member_telegram_id": member_telegram_id,
+                "created_at": now,
+            }
+        ).execute()
+        return True, ""
+    except Exception as e:
+        err = str(e).lower()
+        if "23505" in str(e) or "duplicate" in err or "unique" in err:
+            return False, "dup"
+        print(f"team_members insert failed: {e}")
+        return False, "db"
 
 
 def team_bundle_crypto_amount_str(seats: int) -> str:
@@ -1477,6 +1574,26 @@ def kb_team_setup_cancel() -> InlineKeyboardMarkup:
     )
 
 
+def kb_team_dashboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="➕ Добавить участников (оплата)",
+                    callback_data=f"{UCB}:team_buy_seats",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="👤 Добавить по Telegram ID",
+                    callback_data=f"{UCB}:team_add_member",
+                )
+            ],
+            [InlineKeyboardButton(text="⬅️ Главное меню", callback_data=f"{UCB}:main")],
+        ]
+    )
+
+
 def text_user_main_menu() -> str:
     # Главное меню теперь — это картинка, а не текст.
     return ""
@@ -1659,7 +1776,9 @@ async def crypto_pay_webhook(request: Request):
                         "✅ <b>Оплата получена</b> — места для команды начислены.\n\n"
                         f"Команда: <b>{esc_html(str(nm))}</b>\n"
                         f"В этой оплате: <b>{n_seats}</b> мест(а)\n"
-                        f"Всего оплаченных мест: <b>{total_seats}</b>"
+                        f"Всего оплаченных мест: <b>{total_seats}</b>\n\n"
+                        "Добавьте участников в боте: <b>Команда</b> → "
+                        "<b>Добавить по Telegram ID</b>."
                     ),
                     parse_mode="HTML",
                 )
@@ -2672,17 +2791,12 @@ async def cb_user_team_menu(query: CallbackQuery, state: FSMContext):
     await state.clear()
     team = team_get_by_owner(uid)
     if team and int(team.get("seats_purchased") or 0) > 0:
-        text = (
-            "👥 <b>Команда</b>\n\n"
-            f"Название: <b>{esc_html(str(team.get('name') or '—'))}</b>\n"
-            f"Оплаченных мест для участников: <b>{int(team.get('seats_purchased') or 0)}</b>\n\n"
-            "Приглашение участников — в следующих обновлениях."
-        )
+        text = format_team_dashboard_html(team, uid)
         await safe_edit_text(
             query.message,
             text,
             parse_mode="HTML",
-            reply_markup=kb_user_back_main(),
+            reply_markup=kb_team_dashboard(),
         )
         await query.answer()
         return
@@ -2719,9 +2833,70 @@ async def cb_user_team_setup_cancel(query: CallbackQuery, state: FSMContext):
     await state.clear()
     await safe_edit_text(
         query.message,
-        "Создание команды прервано. Откройте «Команда» снова, чтобы продолжить.",
+        "Действие прервано. Откройте «Команда» снова, чтобы продолжить.",
         parse_mode="HTML",
         reply_markup=kb_user_back_main(),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == f"{UCB}:team_buy_seats")
+async def cb_team_buy_seats(query: CallbackQuery, state: FSMContext):
+    if not await require_policies_or_block(query):
+        return
+    uid = query.from_user.id
+    if not user_has_active_team_plan(uid):
+        await query.answer("Доступно только при активной подписке TEAM.", show_alert=True)
+        return
+    team = team_get_by_owner(uid)
+    if not team or int(team.get("seats_purchased") or 0) < 1:
+        await query.answer("Сначала завершите создание команды и первую оплату.", show_alert=True)
+        return
+    await state.set_state(UserTeamStates.add_seats_count)
+    await safe_edit_text(
+        query.message,
+        "➕ <b>Дополнительные места</b>\n\n"
+        f"Команда: <b>{esc_html(str(team.get('name') or '—'))}</b>\n\n"
+        "Введите, <b>сколько мест</b> добавить — целое число от <b>1</b> до <b>100</b>.\n"
+        f"Стоимость: <b>{TEAM_SEAT_PRICE_USD:g} USD</b> за каждое место — одним счётом в Crypto Bot.\n\n"
+        "/cancel — прервать.",
+        parse_mode="HTML",
+        reply_markup=kb_team_setup_cancel(),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == f"{UCB}:team_add_member")
+async def cb_team_add_member(query: CallbackQuery, state: FSMContext):
+    if not await require_policies_or_block(query):
+        return
+    uid = query.from_user.id
+    if not user_has_active_team_plan(uid):
+        await query.answer("Доступно только при активной подписке TEAM.", show_alert=True)
+        return
+    team = team_get_by_owner(uid)
+    if not team or int(team.get("seats_purchased") or 0) < 1:
+        await query.answer("Сначала завершите создание команды и оплату мест.", show_alert=True)
+        return
+    team_id = str(team["id"])
+    seats = int(team.get("seats_purchased") or 0)
+    if team_members_count(team_id) >= seats:
+        await query.answer(
+            "Нет свободных мест. Нажмите «Добавить участников (оплата)» и оплатите слоты.",
+            show_alert=True,
+        )
+        return
+    await state.set_state(UserTeamStates.add_member_id)
+    free = seats - team_members_count(team_id)
+    await safe_edit_text(
+        query.message,
+        "👤 <b>Добавление участника</b>\n\n"
+        f"Свободных слотов: <b>{free}</b> из <b>{seats}</b>.\n\n"
+        "Отправьте <b>числовой Telegram User ID</b> участника (узнать можно у @userinfobot и подобных).\n"
+        "Можно несколько ID в одном сообщении через пробел или запятую.\n\n"
+        "/cancel — прервать.",
+        parse_mode="HTML",
+        reply_markup=kb_team_setup_cancel(),
     )
     await query.answer()
 
@@ -3387,6 +3562,152 @@ async def process_team_seats(message: Message, state: FSMContext):
     )
 
 
+@dp.message(UserTeamStates.add_seats_count, F.text)
+async def process_team_add_seats_count(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    if not is_admin(uid) and not policies_user_has_accepted(uid):
+        await state.clear()
+        return
+    if not user_has_active_team_plan(uid):
+        await state.clear()
+        return
+    raw = (message.text or "").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        await message.answer(
+            "Введите целое число от 1 до 100.",
+            reply_markup=kb_team_setup_cancel(),
+        )
+        return
+    if n < 1 or n > 100:
+        await message.answer(
+            "Число должно быть от 1 до 100.",
+            reply_markup=kb_team_setup_cancel(),
+        )
+        return
+    team = team_get_by_owner(uid)
+    if not team or int(team.get("seats_purchased") or 0) < 1:
+        await state.clear()
+        await message.answer(
+            "Команда не найдена или нет оплаченных мест. Откройте «Команда» в меню.",
+            reply_markup=kb_user_back_main(),
+        )
+        return
+    team_id = str(team["id"])
+    amount = team_bundle_crypto_amount_str(n)
+    total_usd = float(n) * TEAM_SEAT_PRICE_USD
+    payload = f"nu_kind=team_bundle;tg={uid};team={team_id};seats={n}"
+    nm = str(team.get("name") or "")[:80]
+    desc = f"Neuro Uploader — команда, +{n} мест"
+    if nm:
+        desc = f"Neuro Uploader — «{nm}» — +{n} мест(а)"
+    pay_url, err = await crypto_pay_create_invoice(
+        asset=CRYPTO_PAY_ASSET,
+        amount=amount,
+        description=desc,
+        payload=payload,
+    )
+    await state.clear()
+    if err:
+        await message.answer(
+            f"⚠️ {esc_html(err)}\n\nПовторите ввод или откройте «Команда».",
+            parse_mode="HTML",
+            reply_markup=kb_user_back_main(),
+        )
+        return
+    net_hint = (
+        "Тестовая оплата через <b>@CryptoTestnetBot</b>."
+        if CRYPTO_PAY_TESTNET
+        else "Оплата через <b>@CryptoBot</b>."
+    )
+    await message.answer(
+        "<b>Счёт в Crypto Bot</b> (доп. места)\n\n"
+        f"Мест: <b>{n}</b> × <b>{TEAM_SEAT_PRICE_USD:g} USD</b> ≈ <b>{total_usd:g} USD</b> "
+        f"(сумма в счёте: <b>{esc_html(amount)} {esc_html(CRYPTO_PAY_ASSET)}</b>).\n"
+        f"{net_hint}\n\n"
+        "<b>Выберите вариант оплаты:</b>",
+        parse_mode="HTML",
+        reply_markup=kb_team_after_invoice(pay_url or ""),
+    )
+
+
+@dp.message(UserTeamStates.add_member_id, F.text)
+async def process_team_add_member_id(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    if not is_admin(uid) and not policies_user_has_accepted(uid):
+        await state.clear()
+        return
+    if not user_has_active_team_plan(uid):
+        await state.clear()
+        return
+    team = team_get_by_owner(uid)
+    if not team or int(team.get("seats_purchased") or 0) < 1:
+        await state.clear()
+        await message.answer(
+            "Команда не найдена. Откройте «Команда» в меню.",
+            reply_markup=kb_user_back_main(),
+        )
+        return
+    team_id = str(team["id"])
+    seats = int(team.get("seats_purchased") or 0)
+    raw = (message.text or "").strip()
+    tokens = [x for x in re.split(r"[\s,;]+", raw) if x.strip()]
+    if not tokens:
+        await message.answer(
+            "Введите один или несколько числовых Telegram ID.",
+            reply_markup=kb_team_setup_cancel(),
+        )
+        return
+    occupied = team_members_count(team_id)
+    added: list[int] = []
+    errs: list[str] = []
+    for tok in tokens:
+        try:
+            mid = int(tok.strip())
+        except ValueError:
+            errs.append(f"Не число: <code>{esc_html(tok[:40])}</code>")
+            continue
+        ok, code = team_try_add_member(
+            team_id, uid, mid, occupied_slots=occupied, seats_total=seats
+        )
+        if ok:
+            added.append(mid)
+            occupied += 1
+        elif code == "dup":
+            errs.append(f"Уже в списке: <code>{mid}</code>")
+        elif code == "owner":
+            errs.append("Нельзя добавить свой собственный ID.")
+        elif code == "full":
+            errs.append("Лимит мест исчерпан — оплатите дополнительные слоты.")
+            break
+        elif code == "not_owner":
+            await state.clear()
+            await message.answer("Ошибка доступа.", reply_markup=kb_user_back_main())
+            return
+        else:
+            errs.append(
+                f"Не добавлен <code>{mid}</code>: проверьте таблицу team_members (SQL) или повторите позже."
+            )
+    parts = []
+    if added:
+        parts.append("✅ Добавлено: " + ", ".join(f"<code>{x}</code>" for x in added))
+    if errs:
+        parts.append("\n".join(errs))
+    free_now = max(0, seats - occupied)
+    parts.append(
+        f"\nСвободных слотов: <b>{free_now}</b> из <b>{seats}</b>.\n"
+        "Отправьте ещё ID или откройте «Команда» для списка."
+    )
+    await message.answer(
+        "\n\n".join(parts),
+        parse_mode="HTML",
+        reply_markup=kb_team_setup_cancel() if free_now > 0 else kb_team_dashboard(),
+    )
+    if free_now <= 0:
+        await state.clear()
+
+
 @dp.callback_query(F.data == f"{UCB}:support")
 async def cb_user_support_placeholder(query: CallbackQuery):
     if not await require_policies_or_block(query):
@@ -3448,10 +3769,15 @@ async def cmd_cancel(message: Message, state: FSMContext):
                 reply_markup=kb_referrals_screen(),
             )
         return
-    if current == UserTeamStates.name or current == UserTeamStates.seats_count:
+    if current in (
+        UserTeamStates.name,
+        UserTeamStates.seats_count,
+        UserTeamStates.add_seats_count,
+        UserTeamStates.add_member_id,
+    ):
         await state.clear()
         await message.answer(
-            "Создание команды отменено.",
+            "Действие с командой отменено.",
             reply_markup=kb_user_back_main(),
         )
         return
