@@ -8,6 +8,7 @@ import json
 import os
 import re
 import time
+import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -108,6 +109,8 @@ CRYPTO_PAY_TESTNET = (os.environ.get("CRYPTO_PAY_TESTNET") or "true").strip().lo
     "on",
 )
 CRYPTO_PAY_ASSET = (os.environ.get("CRYPTO_PAY_ASSET") or "TON").strip().upper()
+# Текст «$ за место» в боте; сумма в крипте — CRYPTO_PAY_AMOUNT_TEAM_SEAT × места (см. team_bundle_crypto_amount_str).
+TEAM_SEAT_PRICE_USD = float((os.environ.get("TEAM_SEAT_PRICE_USD") or "10").strip() or "10")
 REFERRAL_PERCENT_DEFAULT = float((os.environ.get("REFERRAL_PERCENT_DEFAULT") or "10").strip())
 REFERRAL_MIN_WITHDRAW_USD = float((os.environ.get("REFERRAL_MIN_WITHDRAW_USD") or "10").strip())
 REFERRAL_BURN_INACTIVE_DAYS = int((os.environ.get("REFERRAL_BURN_INACTIVE_DAYS") or "30").strip() or "30")
@@ -230,6 +233,12 @@ class AdminStates(StatesGroup):
 
 class UserReferralWithdrawStates(StatesGroup):
     amount = State()
+
+
+class UserTeamStates(StatesGroup):
+    """Создание команды: название → число мест → оплата."""
+    name = State()
+    seats_count = State()
 
 
 def is_admin(user_id: int) -> bool:
@@ -458,6 +467,121 @@ def users_telegram_ids_for_broadcast() -> list[int]:
 def user_get(tid: int):
     r = supabase.table("users").select("*").eq("telegram_id", tid).execute()
     return r.data[0] if r.data else None
+
+
+def user_has_active_team_plan(telegram_id: int) -> bool:
+    """Активная подписка с планом TEAM (код t в users.subscription_plan)."""
+    u = user_get(telegram_id)
+    if not u:
+        return False
+    if (u.get("subscription_plan") or "").strip().lower() != "t":
+        return False
+    return int(u.get("subscription_until") or 0) >= int(time.time())
+
+
+def team_get_by_owner(owner_telegram_id: int) -> Optional[dict]:
+    try:
+        r = (
+            supabase.table("teams")
+            .select("*")
+            .eq("owner_telegram_id", owner_telegram_id)
+            .limit(1)
+            .execute()
+        )
+        return r.data[0] if r.data else None
+    except Exception as e:
+        print(f"teams select owner={owner_telegram_id}: {e}")
+        return None
+
+
+def team_create_for_owner(owner_telegram_id: int, name: str) -> Optional[str]:
+    """Создаёт команду, возвращает id (uuid str) или None."""
+    nm = (name or "").strip()
+    if len(nm) < 2:
+        return None
+    nm = nm[:200]
+    now = int(time.time())
+    try:
+        supabase.table("teams").insert(
+            {
+                "owner_telegram_id": owner_telegram_id,
+                "name": nm,
+                "seats_purchased": 0,
+                "created_at": now,
+            }
+        ).execute()
+    except Exception as e:
+        err = str(e).lower()
+        if "23505" in str(e) or "duplicate" in err or "unique" in err:
+            t = team_get_by_owner(owner_telegram_id)
+            return str(t["id"]) if t else None
+        print(f"teams insert failed: {e}")
+        return None
+    t = team_get_by_owner(owner_telegram_id)
+    return str(t["id"]) if t else None
+
+
+def team_add_seats_paid(team_id: str, owner_telegram_id: int, seats: int) -> bool:
+    if seats < 1 or seats > 100:
+        return False
+    t = team_get_by_owner(owner_telegram_id)
+    if not t or str(t.get("id")) != str(team_id):
+        return False
+    new_total = int(t.get("seats_purchased") or 0) + seats
+    try:
+        supabase.table("teams").update({"seats_purchased": new_total}).eq("id", team_id).eq(
+            "owner_telegram_id", owner_telegram_id
+        ).execute()
+        return True
+    except Exception as e:
+        print(f"teams update seats failed: {e}")
+        return False
+
+
+def team_bundle_crypto_amount_str(seats: int) -> str:
+    per = (os.environ.get("CRYPTO_PAY_AMOUNT_TEAM_SEAT") or "10").strip()
+    try:
+        p = float(per)
+    except (TypeError, ValueError):
+        p = 10.0
+    total = max(0.0, p * float(seats))
+    s = f"{total:.8f}".rstrip("0").rstrip(".")
+    return s if s else "0"
+
+
+def parse_team_bundle_payload(raw: Optional[str]) -> Optional[tuple[int, str, int]]:
+    """payload: nu_kind=team_bundle;tg=...;team=<uuid>;seats=N → (tg, team_id, seats)."""
+    if not raw or not isinstance(raw, str):
+        return None
+    kind: Optional[str] = None
+    tg: Optional[int] = None
+    team_id: Optional[str] = None
+    seats: Optional[int] = None
+    for part in raw.split(";"):
+        part = part.strip()
+        if part.startswith("nu_kind="):
+            kind = part[8:].strip().lower()
+        elif part.startswith("tg="):
+            try:
+                tg = int(part[3:].strip())
+            except ValueError:
+                pass
+        elif part.startswith("team="):
+            team_id = part[5:].strip()
+        elif part.startswith("seats="):
+            try:
+                seats = int(part[6:].strip())
+            except ValueError:
+                pass
+    if kind != "team_bundle" or tg is None or not team_id or seats is None:
+        return None
+    if seats < 1 or seats > 100:
+        return None
+    try:
+        uuid.UUID(team_id)
+    except (ValueError, TypeError):
+        return None
+    return tg, team_id, seats
 
 
 def format_telegram_username_for_db(telegram_id: int, username: Optional[str]) -> str:
@@ -1124,6 +1248,7 @@ def kb_admin_tariff_plans():
             [InlineKeyboardButton(text="STANDART", callback_data=f"{CB}:tpe:s")],
             [InlineKeyboardButton(text="PRO", callback_data=f"{CB}:tpe:p")],
             [InlineKeyboardButton(text="MAX", callback_data=f"{CB}:tpe:m")],
+            [InlineKeyboardButton(text="TEAM", callback_data=f"{CB}:tpe:t")],
             [InlineKeyboardButton(text="⬅️ Админ-меню", callback_data=f"{CB}:menu")],
         ]
     )
@@ -1234,8 +1359,8 @@ def kb_policies_accept():
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def kb_user_main_menu():
-    """Главное меню пользователя: Профиль|Отзывы, Тарифы|Рефералы, Поддержка."""
+def kb_user_main_menu(telegram_user_id: Optional[int] = None):
+    """Главное меню пользователя: Профиль|Отзывы, Тарифы|Рефералы, Поддержка; «Команда» — только при активном TEAM."""
     profile_btn = InlineKeyboardButton(text="👤 Профиль", callback_data=f"{UCB}:profile")
     # По требованию: «Отзывы» — просто картинка, поэтому всегда открываем callback.
     reviews_btn = InlineKeyboardButton(text="⭐ Отзывы", callback_data=f"{UCB}:reviews")
@@ -1252,13 +1377,16 @@ def kb_user_main_menu():
     else:
         support_btn = InlineKeyboardButton(text="💬 Поддержка", callback_data=f"{UCB}:support")
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [profile_btn, reviews_btn],
-            [tariffs_btn, referrals_btn],
-            [support_btn],
-        ]
-    )
+    rows: list[list[InlineKeyboardButton]] = [
+        [profile_btn, reviews_btn],
+        [tariffs_btn, referrals_btn],
+    ]
+    if telegram_user_id is not None and user_has_active_team_plan(telegram_user_id):
+        rows.append(
+            [InlineKeyboardButton(text="👥 Команда", callback_data=f"{UCB}:team")]
+        )
+    rows.append([support_btn])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def kb_user_back_main():
@@ -1304,7 +1432,7 @@ def kb_tariffs():
             [InlineKeyboardButton(text="STANDART", callback_data=f"{UCB}:tariff:s")],
             [InlineKeyboardButton(text="PRO", callback_data=f"{UCB}:tariff:p")],
             [InlineKeyboardButton(text="MAX", callback_data=f"{UCB}:tariff:m")],
-            [InlineKeyboardButton(text="TEAM (soon)", callback_data=f"{UCB}:tariff:t")],
+            [InlineKeyboardButton(text="TEAM", callback_data=f"{UCB}:tariff:t")],
             [InlineKeyboardButton(text="⬅️ Главное меню", callback_data=f"{UCB}:main")],
         ]
     )
@@ -1331,6 +1459,24 @@ def kb_tariff_after_invoice(code: str, pay_url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def kb_team_after_invoice(pay_url: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💎 Оплатить в Crypto Bot", url=pay_url)],
+            [InlineKeyboardButton(text="⬅️ К разделу «Команда»", callback_data=f"{UCB}:team")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data=f"{UCB}:main")],
+        ]
+    )
+
+
+def kb_team_setup_cancel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"{UCB}:team_cancel")],
+        ]
+    )
+
+
 def text_user_main_menu() -> str:
     # Главное меню теперь — это картинка, а не текст.
     return ""
@@ -1349,7 +1495,7 @@ def build_user_profile_public_text(tid: int, u: Optional[dict]) -> str:
     active = sub >= now
     active_word = "активна" if active else "неактивна"
     plan_code = (u.get("subscription_plan") or "").strip().lower()
-    plan_label = {"s": "STANDART", "p": "PRO", "m": "MAX"}.get(plan_code, "—")
+    plan_label = {"s": "STANDART", "p": "PRO", "m": "MAX", "t": "TEAM"}.get(plan_code, "—")
     username = (u.get("username") or "").strip() or "—"
     return (
         "👤 <b>Профиль</b>\n\n"
@@ -1486,6 +1632,39 @@ async def crypto_pay_webhook(request: Request):
     try:
         invoice_id = int(inv["invoice_id"])
     except (KeyError, TypeError, ValueError):
+        return PlainTextResponse("OK", status_code=200)
+
+    bundle = parse_team_bundle_payload(inv.get("payload"))
+    if bundle is not None:
+        telegram_id, team_uuid, n_seats = bundle
+        mark_tb = crypto_invoice_mark_processed(invoice_id, telegram_id, "team_bundle")
+        if mark_tb == "duplicate":
+            return PlainTextResponse("OK", status_code=200)
+        if mark_tb == "error":
+            raise HTTPException(
+                status_code=503,
+                detail="Таблица crypto_pay_processed_invoices недоступна — выполните SQL из crypto_pay_processed_invoices.sql",
+            )
+        if not team_add_seats_paid(team_uuid, telegram_id, n_seats):
+            print(f"crypto webhook team_bundle: не удалось начислить места, invoice={invoice_id}")
+        await referral_process_paid_invoice(inv, telegram_id, False)
+        if bot:
+            t = team_get_by_owner(telegram_id)
+            nm = (t or {}).get("name") or "—"
+            total_seats = int((t or {}).get("seats_purchased") or 0)
+            try:
+                await bot.send_message(
+                    chat_id=telegram_id,
+                    text=(
+                        "✅ <b>Оплата получена</b> — места для команды начислены.\n\n"
+                        f"Команда: <b>{esc_html(str(nm))}</b>\n"
+                        f"В этой оплате: <b>{n_seats}</b> мест(а)\n"
+                        f"Всего оплаченных мест: <b>{total_seats}</b>"
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                print(f"crypto pay team_bundle: уведомление пользователю {telegram_id}: {e}")
         return PlainTextResponse("OK", status_code=200)
 
     plan_code, telegram_id, is_renewal_price = parse_nu_crypto_invoice_payload(inv.get("payload"))
@@ -1637,7 +1816,7 @@ async def verify_subscription(telegram_id: int):
         plan = plan.strip().lower()
     else:
         plan = "m"
-    if plan not in ("s", "p", "m"):
+    if plan not in ("s", "p", "m", "t"):
         plan = "m"
     return {"status": "success", "message": "Subscription active", "subscription_plan": plan}
 
@@ -1801,16 +1980,18 @@ _TARIFF_PLAN_IMAGE_PATH_KEYS: dict[str, tuple[str, ...]] = {
     "s": ("TARIFF_PLAN_IMAGE_PATH_S", "TARIFF_IMAGE_STANDART_PATH"),
     "p": ("TARIFF_PLAN_IMAGE_PATH_P", "TARIFF_IMAGE_PRO_PATH"),
     "m": ("TARIFF_PLAN_IMAGE_PATH_M", "TARIFF_IMAGE_MAX_PATH"),
+    "t": ("TARIFF_PLAN_IMAGE_PATH_T", "TARIFF_IMAGE_TEAM_PATH"),
 }
 _TARIFF_PLAN_IMAGE_URL_KEYS: dict[str, tuple[str, ...]] = {
     "s": ("TARIFF_PLAN_IMAGE_URL_S", "TARIFF_IMAGE_STANDART_URL"),
     "p": ("TARIFF_PLAN_IMAGE_URL_P", "TARIFF_IMAGE_PRO_URL"),
     "m": ("TARIFF_PLAN_IMAGE_URL_M", "TARIFF_IMAGE_MAX_URL"),
+    "t": ("TARIFF_PLAN_IMAGE_URL_T", "TARIFF_IMAGE_TEAM_URL"),
 }
 
 
 def tariff_plan_photo_for_plan(code: str) -> Optional[object]:
-    """Для карточки тарифа s|p|m: FSInputFile или URL. None — только текст (как раньше)."""
+    """Для карточки тарифа s|p|m|t: FSInputFile или URL. None — только текст (как раньше)."""
     if code not in _TARIFF_PLAN_IMAGE_PATH_KEYS:
         return None
     for ek in _TARIFF_PLAN_IMAGE_PATH_KEYS[code]:
@@ -2106,7 +2287,7 @@ async def show_user_main_menu(
                 photo=photo,
                 caption=extra_caption or None,
                 parse_mode="Markdown",
-                reply_markup=kb_user_main_menu(),
+                reply_markup=kb_user_main_menu(telegram_user_id),
             )
             return
         except Exception as e:
@@ -2119,7 +2300,7 @@ async def show_user_main_menu(
                 document=doc,
                 caption=extra_caption or None,
                 parse_mode="Markdown",
-                reply_markup=kb_user_main_menu(),
+                reply_markup=kb_user_main_menu(telegram_user_id),
             )
             return
         except Exception as e:
@@ -2132,7 +2313,7 @@ async def show_user_main_menu(
         chat_id=chat_id,
         text=text_out,
         parse_mode="Markdown" if extra_caption else None,
-        reply_markup=kb_user_main_menu(),
+        reply_markup=kb_user_main_menu(telegram_user_id),
     )
 
 
@@ -2480,6 +2661,71 @@ async def cb_user_back_main(query: CallbackQuery, state: FSMContext):
     await query.answer()
 
 
+@dp.callback_query(F.data == f"{UCB}:team")
+async def cb_user_team_menu(query: CallbackQuery, state: FSMContext):
+    if not await require_policies_or_block(query):
+        return
+    uid = query.from_user.id
+    if not user_has_active_team_plan(uid):
+        await query.answer("Доступно только при активной подписке TEAM.", show_alert=True)
+        return
+    await state.clear()
+    team = team_get_by_owner(uid)
+    if team and int(team.get("seats_purchased") or 0) > 0:
+        text = (
+            "👥 <b>Команда</b>\n\n"
+            f"Название: <b>{esc_html(str(team.get('name') or '—'))}</b>\n"
+            f"Оплаченных мест для участников: <b>{int(team.get('seats_purchased') or 0)}</b>\n\n"
+            "Приглашение участников — в следующих обновлениях."
+        )
+        await safe_edit_text(
+            query.message,
+            text,
+            parse_mode="HTML",
+            reply_markup=kb_user_back_main(),
+        )
+        await query.answer()
+        return
+    if not team:
+        await state.set_state(UserTeamStates.name)
+        await safe_edit_text(
+            query.message,
+            "👥 <b>Создание команды</b>\n\n"
+            "Введите <b>название команды</b> (от 2 символов).\n\n"
+            "/cancel — прервать.",
+            parse_mode="HTML",
+            reply_markup=kb_team_setup_cancel(),
+        )
+        await query.answer()
+        return
+    await state.set_state(UserTeamStates.seats_count)
+    await safe_edit_text(
+        query.message,
+        "👥 <b>Создание команды</b>\n\n"
+        f"Команда: <b>{esc_html(str(team.get('name') or '—'))}</b>\n\n"
+        "Введите <b>количество участников</b> целым числом от <b>1</b> до <b>100</b>.\n"
+        f"Стоимость: <b>{TEAM_SEAT_PRICE_USD:g} USD</b> за каждого — оплата одним счётом в Crypto Bot.\n\n"
+        "/cancel — прервать.",
+        parse_mode="HTML",
+        reply_markup=kb_team_setup_cancel(),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == f"{UCB}:team_cancel")
+async def cb_user_team_setup_cancel(query: CallbackQuery, state: FSMContext):
+    if not await require_policies_or_block(query):
+        return
+    await state.clear()
+    await safe_edit_text(
+        query.message,
+        "Создание команды прервано. Откройте «Команда» снова, чтобы продолжить.",
+        parse_mode="HTML",
+        reply_markup=kb_user_back_main(),
+    )
+    await query.answer()
+
+
 @dp.callback_query(F.data == f"{UCB}:profile")
 async def cb_user_profile_menu(query: CallbackQuery):
     if not await require_policies_or_block(query):
@@ -2553,12 +2799,14 @@ _TARIFF_PLAN_ENV = {
     "s": "TEXT_PLAN_STANDART",
     "p": "TEXT_PLAN_PRO",
     "m": "TEXT_PLAN_MAX",
+    "t": "TEXT_PLAN_TEAM",
 }
 # app_settings: полный HTML карточки тарифа (приоритет над TEXT_PLAN_* и _TARIFF_PLAN_DEFAULT).
 _TARIFF_PLAN_SETTINGS_KEYS = {
     "s": "tariff_plan_html_s",
     "p": "tariff_plan_html_p",
     "m": "tariff_plan_html_m",
+    "t": "tariff_plan_html_t",
 }
 _TARIFF_PLAN_DEFAULT = {
     "s": (
@@ -2597,6 +2845,12 @@ _TARIFF_PLAN_DEFAULT = {
         "• Приоритетная поддержка\n"
         "• Доступ к ИИ"
     ),
+    "t": (
+        "<b>TEAM</b>\n\n"
+        "Командный тариф: доступ к софту для владельца и управление командой в боте "
+        "(кнопка <b>«Команда»</b> в главном меню при активной подписке).\n\n"
+        "Уточните цены и лимиты в поддержке или задайте <code>TEXT_PLAN_TEAM</code> в .env."
+    ),
 }
 
 
@@ -2612,21 +2866,23 @@ def tariff_plan_body_html(code: str) -> str:
     return (os.environ.get(env_key) or "").strip() or _TARIFF_PLAN_DEFAULT[code]
 
 
-_PLAN_INVOICE_LABEL = {"s": "STANDART", "p": "PRO", "m": "MAX"}
+_PLAN_INVOICE_LABEL = {"s": "STANDART", "p": "PRO", "m": "MAX", "t": "TEAM"}
 # Имена без суффикса _P (в Railway «сырой» ввод переменных ломает строки вроде ..._P=...).
 _PLAN_AMOUNT_ENV_KEYS = {
     "s": ("CRYPTO_PAY_AMOUNT_STANDART", "CRYPTO_PAY_AMOUNT_S"),
     "p": ("CRYPTO_PAY_AMOUNT_PRO", "CRYPTO_PAY_AMOUNT_P"),
     "m": ("CRYPTO_PAY_AMOUNT_MAX", "CRYPTO_PAY_AMOUNT_M"),
+    "t": ("CRYPTO_PAY_AMOUNT_TEAM", "CRYPTO_PAY_AMOUNT_T"),
 }
-_PLAN_AMOUNT_DEFAULT = {"s": "0.1", "p": "0.15", "m": "0.2"}
+_PLAN_AMOUNT_DEFAULT = {"s": "0.1", "p": "0.15", "m": "0.2", "t": "0.25"}
 # Продление после истечения подписки (см. user_eligible_for_renewal_price).
 _PLAN_RENEW_AMOUNT_ENV_KEYS = {
     "s": ("CRYPTO_PAY_RENEW_AMOUNT_STANDART", "CRYPTO_PAY_RENEW_AMOUNT_S"),
     "p": ("CRYPTO_PAY_RENEW_AMOUNT_PRO", "CRYPTO_PAY_RENEW_AMOUNT_P"),
     "m": ("CRYPTO_PAY_RENEW_AMOUNT_MAX", "CRYPTO_PAY_RENEW_AMOUNT_M"),
+    "t": ("CRYPTO_PAY_RENEW_AMOUNT_TEAM", "CRYPTO_PAY_RENEW_AMOUNT_T"),
 }
-_PLAN_RENEW_AMOUNT_DEFAULT = {"s": "0.08", "p": "0.12", "m": "0.18"}
+_PLAN_RENEW_AMOUNT_DEFAULT = {"s": "0.08", "p": "0.12", "m": "0.18", "t": "0.2"}
 
 
 def tariff_plan_invoice_label(code: str) -> str:
@@ -2651,8 +2907,9 @@ _PLAN_SUB_DAYS_ENV_KEYS = {
     "s": ("SUBSCRIPTION_DAYS_STANDART", "SUBSCRIPTION_DAYS_S"),
     "p": ("SUBSCRIPTION_DAYS_PRO", "SUBSCRIPTION_DAYS_P"),
     "m": ("SUBSCRIPTION_DAYS_MAX", "SUBSCRIPTION_DAYS_M"),
+    "t": ("SUBSCRIPTION_DAYS_TEAM", "SUBSCRIPTION_DAYS_T"),
 }
-_PLAN_SUB_DAYS_DEFAULT = {"s": 30, "p": 30, "m": 30}
+_PLAN_SUB_DAYS_DEFAULT = {"s": 30, "p": 30, "m": 30, "t": 30}
 
 
 def subscription_days_for_plan(code: str) -> int:
@@ -2715,9 +2972,6 @@ async def cb_user_tariff_plan(query: CallbackQuery):
     if not await require_policies_or_block(query):
         return
     code = (query.data or "").split(":")[-1]
-    if code == "t":
-        await query.answer("Тариф TEAM скоро будет доступен.", show_alert=True)
-        return
     if code not in _TARIFF_PLAN_ENV:
         await query.answer()
         return
@@ -3015,6 +3269,124 @@ async def process_referral_withdraw_amount(message: Message, state: FSMContext):
         )
 
 
+@dp.message(UserTeamStates.name, F.text)
+async def process_team_name(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    if not is_admin(uid) and not policies_user_has_accepted(uid):
+        await state.clear()
+        return
+    if not user_has_active_team_plan(uid):
+        await state.clear()
+        return
+    raw = (message.text or "").strip()
+    if len(raw) < 2:
+        await message.answer(
+            "Название слишком короткое. Введите минимум 2 символа.",
+            reply_markup=kb_team_setup_cancel(),
+        )
+        return
+    if team_get_by_owner(uid):
+        await state.set_state(UserTeamStates.seats_count)
+        await message.answer(
+            "Команда уже создана. Введите количество участников (целое число от 1 до 100).",
+            reply_markup=kb_team_setup_cancel(),
+        )
+        return
+    if not team_create_for_owner(uid, raw):
+        await message.answer(
+            "Не удалось сохранить команду. Проверьте, что в Supabase создана таблица teams (файл teams.sql).",
+            reply_markup=kb_team_setup_cancel(),
+        )
+        return
+    await state.set_state(UserTeamStates.seats_count)
+    await message.answer(
+        "👥 <b>Создание команды</b>\n\n"
+        f"Команда: <b>{esc_html(raw)}</b>\n\n"
+        "Введите <b>количество участников</b> целым числом от <b>1</b> до <b>100</b>.\n"
+        f"Стоимость: <b>{TEAM_SEAT_PRICE_USD:g} USD</b> за каждого — одним счётом в Crypto Bot.\n\n"
+        "/cancel — прервать.",
+        parse_mode="HTML",
+        reply_markup=kb_team_setup_cancel(),
+    )
+
+
+@dp.message(UserTeamStates.seats_count, F.text)
+async def process_team_seats(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    if not is_admin(uid) and not policies_user_has_accepted(uid):
+        await state.clear()
+        return
+    if not user_has_active_team_plan(uid):
+        await state.clear()
+        return
+    raw = (message.text or "").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        await message.answer(
+            "Введите целое число от 1 до 100.",
+            reply_markup=kb_team_setup_cancel(),
+        )
+        return
+    if n < 1 or n > 100:
+        await message.answer(
+            "Число должно быть от 1 до 100.",
+            reply_markup=kb_team_setup_cancel(),
+        )
+        return
+    team = team_get_by_owner(uid)
+    if not team:
+        await state.clear()
+        await message.answer(
+            "Команда не найдена. Откройте раздел «Команда» в меню заново.",
+            reply_markup=kb_user_back_main(),
+        )
+        return
+    if int(team.get("seats_purchased") or 0) > 0:
+        await state.clear()
+        await message.answer(
+            "Места уже оплачены. Откройте «Команда» в меню.",
+            reply_markup=kb_user_back_main(),
+        )
+        return
+    team_id = str(team["id"])
+    amount = team_bundle_crypto_amount_str(n)
+    total_usd = float(n) * TEAM_SEAT_PRICE_USD
+    payload = f"nu_kind=team_bundle;tg={uid};team={team_id};seats={n}"
+    nm = str(team.get("name") or "")[:80]
+    desc = f"Neuro Uploader — команда, {n} мест"
+    if nm:
+        desc = f"Neuro Uploader — «{nm}» — {n} мест(а)"
+    pay_url, err = await crypto_pay_create_invoice(
+        asset=CRYPTO_PAY_ASSET,
+        amount=amount,
+        description=desc,
+        payload=payload,
+    )
+    await state.clear()
+    if err:
+        await message.answer(
+            f"⚠️ {esc_html(err)}\n\nОткройте «Команда» и введите количество снова.",
+            parse_mode="HTML",
+            reply_markup=kb_user_back_main(),
+        )
+        return
+    net_hint = (
+        "Тестовая оплата через <b>@CryptoTestnetBot</b>."
+        if CRYPTO_PAY_TESTNET
+        else "Оплата через <b>@CryptoBot</b>."
+    )
+    await message.answer(
+        "<b>Счёт в Crypto Bot</b>\n\n"
+        f"Мест: <b>{n}</b> × <b>{TEAM_SEAT_PRICE_USD:g} USD</b> ≈ <b>{total_usd:g} USD</b> "
+        f"(сумма в счёте: <b>{esc_html(amount)} {esc_html(CRYPTO_PAY_ASSET)}</b>).\n"
+        f"{net_hint}\n\n"
+        "<b>Выберите вариант оплаты:</b>",
+        parse_mode="HTML",
+        reply_markup=kb_team_after_invoice(pay_url or ""),
+    )
+
+
 @dp.callback_query(F.data == f"{UCB}:support")
 async def cb_user_support_placeholder(query: CallbackQuery):
     if not await require_policies_or_block(query):
@@ -3075,6 +3447,13 @@ async def cmd_cancel(message: Message, state: FSMContext):
                 parse_mode="HTML",
                 reply_markup=kb_referrals_screen(),
             )
+        return
+    if current == UserTeamStates.name or current == UserTeamStates.seats_count:
+        await state.clear()
+        await message.answer(
+            "Создание команды отменено.",
+            reply_markup=kb_user_back_main(),
+        )
         return
     if not is_admin(message.from_user.id):
         return
