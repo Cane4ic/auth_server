@@ -503,10 +503,8 @@ async def _suppress_benign_telegram_errors(event: ErrorEvent):
 
 
 def nu_require_active_subscription(telegram_id: int) -> None:
-    """Доступ к прокси SadCaptcha / Claude только при активной подписке."""
-    user_res = supabase.table("users").select("subscription_until").eq("telegram_id", telegram_id).execute()
-    now = int(time.time())
-    if not user_res.data or int(user_res.data[0].get("subscription_until") or 0) < now:
+    """Доступ к прокси SadCaptcha / Claude при личной подписке или активном месте в команде TEAM."""
+    if not nu_subscription_allowed(telegram_id):
         raise HTTPException(status_code=403, detail="Нет активной подписки")
 
 
@@ -852,6 +850,107 @@ def team_try_add_member(
             return False, "dup"
         print(f"team_members insert failed: {e}")
         return False, "db"
+
+
+def _subscription_until_ts(user_row: dict) -> int:
+    """Безопасно привести users.subscription_until к unix-времени (Supabase может отдать int/str)."""
+    raw = user_row.get("subscription_until")
+    if raw is None:
+        return 0
+    if isinstance(raw, bool):
+        return 0
+    if isinstance(raw, (int, float)):
+        return int(raw)
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return 0
+        try:
+            return int(s)
+        except ValueError:
+            pass
+        try:
+            from datetime import datetime, timezone
+
+            iso = s.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(iso)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp())
+        except Exception:
+            return 0
+    return 0
+
+
+def team_member_has_active_team_access(member_telegram_id: int) -> bool:
+    """Участник в team_members и у владельца команды активна подписка TEAM (plan t, срок не истёк)."""
+    try:
+        r = (
+            supabase.table("team_members")
+            .select("team_id")
+            .eq("member_telegram_id", member_telegram_id)
+            .execute()
+        )
+        for row in r.data or []:
+            tid = row.get("team_id")
+            if not tid:
+                continue
+            tr = (
+                supabase.table("teams")
+                .select("owner_telegram_id")
+                .eq("id", str(tid))
+                .limit(1)
+                .execute()
+            )
+            if not tr.data:
+                continue
+            try:
+                owner = int(tr.data[0].get("owner_telegram_id") or 0)
+            except (TypeError, ValueError):
+                continue
+            if owner > 0 and user_has_active_team_plan(owner):
+                return True
+    except Exception as e:
+        print(f"team_member_has_active_team_access({member_telegram_id}): {e}")
+    return False
+
+
+def user_direct_subscription_active(telegram_id: int) -> bool:
+    u = user_get(telegram_id)
+    if not u:
+        return False
+    return _subscription_until_ts(u) >= int(time.time())
+
+
+def ensure_user_row_for_login(telegram_id: int, username: str) -> Optional[dict]:
+    """Минимальная строка users для HWID; для участника команды без своей подписки."""
+    u = user_get(telegram_id)
+    if u:
+        return u
+    raw = (username or "").strip()
+    if raw.startswith("@"):
+        uname_for_fmt = raw[1:] or None
+    elif raw.isdigit():
+        uname_for_fmt = None
+    else:
+        uname_for_fmt = raw or None
+    un = format_telegram_username_for_db(telegram_id, uname_for_fmt)
+    try:
+        supabase.table("users").insert(
+            {"telegram_id": telegram_id, "username": un, "subscription_until": 0, "hwid": None}
+        ).execute()
+    except Exception as e:
+        err = str(e).lower()
+        if "23505" not in str(e) and "duplicate" not in err and "unique" not in err:
+            print(f"ensure_user_row_for_login insert {telegram_id}: {e}")
+    return user_get(telegram_id)
+
+
+def nu_subscription_allowed(telegram_id: int) -> bool:
+    """Активная личная подписка или место в команде с оплаченным TEAM у владельца."""
+    if user_direct_subscription_active(telegram_id):
+        return True
+    return team_member_has_active_team_access(telegram_id)
 
 
 def team_bundle_crypto_amount_str(seats: int) -> str:
@@ -2144,19 +2243,27 @@ async def list_login_notifications(telegram_id: int, limit: int = 50):
 
 @app.get("/api/auth/verify/{telegram_id}")
 async def verify_subscription(telegram_id: int):
-    user_res = supabase.table("users").select("*").eq("telegram_id", telegram_id).execute()
     current_time = int(time.time())
-    if not user_res.data or user_res.data[0]["subscription_until"] < current_time:
-        return {"status": "failed", "message": "Subscription expired or user not found"}
-    u = user_res.data[0]
-    plan = (u.get("subscription_plan") or "m")
-    if isinstance(plan, str):
-        plan = plan.strip().lower()
-    else:
-        plan = "m"
-    if plan not in ("s", "p", "m", "t"):
-        plan = "m"
-    return {"status": "success", "message": "Subscription active", "subscription_plan": plan}
+    user_res = supabase.table("users").select("*").eq("telegram_id", telegram_id).execute()
+    if user_res.data:
+        u = user_res.data[0]
+        if _subscription_until_ts(u) >= current_time:
+            plan = u.get("subscription_plan") or "m"
+            if isinstance(plan, str):
+                plan = plan.strip().lower()
+            else:
+                plan = "m"
+            if plan not in ("s", "p", "m", "t"):
+                plan = "m"
+            return {"status": "success", "message": "Subscription active", "subscription_plan": plan}
+    if team_member_has_active_team_access(telegram_id):
+        # Лимиты как у MAX: отдельную подписку покупать не нужно
+        return {
+            "status": "success",
+            "message": "Team seat active",
+            "subscription_plan": "m",
+        }
+    return {"status": "failed", "message": "Subscription expired or user not found"}
 
 
 @app.post("/api/nu/sadcaptcha/puzzle")
@@ -2819,8 +2926,11 @@ async def cmd_start(message: Message):
 
     user_res = supabase.table("users").select("*").eq("telegram_id", telegram_id).execute()
     current_time = int(time.time())
+    u_row = user_res.data[0] if user_res.data else None
+    direct_ok = u_row is not None and _subscription_until_ts(u_row) >= current_time
+    team_ok = team_member_has_active_team_access(telegram_id)
 
-    if not user_res.data or user_res.data[0]["subscription_until"] < current_time:
+    if not direct_ok and not team_ok:
         supabase.table("auth_sessions").update({"status": "failed"}).eq("session_id", session_id).execute()
         await message.answer("❌ У вас нет активной подписки.")
         save_login_notification(telegram_id, "app_fail_no_subscription", False)
@@ -2830,7 +2940,15 @@ async def cmd_start(message: Message):
         )
         return
 
-    user = user_res.data[0]
+    if u_row is None and team_ok:
+        u_row = ensure_user_row_for_login(telegram_id, username)
+    if not u_row:
+        supabase.table("auth_sessions").update({"status": "failed"}).eq("session_id", session_id).execute()
+        await message.answer("❌ Не удалось подготовить профиль. Напишите в поддержку или откройте бота и нажмите Старт.")
+        save_login_notification(telegram_id, "app_fail_no_subscription", False)
+        return
+
+    user = u_row
 
     saved_hwid = user.get("hwid")
     if not saved_hwid:
