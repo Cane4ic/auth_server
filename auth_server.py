@@ -43,6 +43,13 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 from supabase import Client, create_client
 
+try:
+    from postgrest.exceptions import APIError as PostgrestAPIError
+except ImportError:  # pragma: no cover
+
+    class PostgrestAPIError(Exception):
+        """Заглушка, если нет postgrest в окружении."""
+
 # ==========================================
 # НАСТРОЙКИ (ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ)
 # ==========================================
@@ -671,8 +678,16 @@ def users_telegram_ids_for_broadcast() -> list[int]:
 
 
 def user_get(tid: int):
-    r = supabase.table("users").select("*").eq("telegram_id", tid).execute()
-    return r.data[0] if r.data else None
+    """Чтение users; при 5xx/сетевых сбоях Supabase — None (не роняем хендлер бота)."""
+    try:
+        r = supabase.table("users").select("*").eq("telegram_id", tid).execute()
+        return r.data[0] if r.data else None
+    except PostgrestAPIError as e:
+        print(f"user_get({tid}) PostgREST: {e}")
+        return None
+    except Exception as e:
+        print(f"user_get({tid}) {type(e).__name__}: {e}")
+        return None
 
 
 def user_has_active_team_plan(telegram_id: int) -> bool:
