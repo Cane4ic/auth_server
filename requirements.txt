@@ -5,3 +5,4 @@ supabase
 pydantic
 requests
 Pillow
+imageio-ffmpeg
