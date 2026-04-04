@@ -279,6 +279,9 @@ class UniqueizerStates(StatesGroup):
     """Уникализатор: шаблон (имя → настройки) и сценарий медиа → копии."""
     tpl_name = State()
     tpl_build = State()
+    uniq_run_mode = State()
+    uniq_pick_tpl = State()
+    uniq_adhoc_build = State()
     uniq_media = State()
     uniq_wait_tpl = State()
     uniq_copies = State()
@@ -986,6 +989,62 @@ def kb_uniqueizer_tpl_build(levels: dict[str, int]) -> InlineKeyboardMarkup:
     rows.append(
         [InlineKeyboardButton(text="✅ Выбрать", callback_data=f"{UCB}:uzfin")],
     )
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"{UCB}:uzhm")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_uniqueizer_run_mode_pick() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📋 По шаблону", callback_data=f"{UCB}:uzpath:tpl")],
+            [InlineKeyboardButton(text="⚙️ Своя настройка", callback_data=f"{UCB}:uzpath:adhoc")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"{UCB}:uzhm")],
+        ]
+    )
+
+
+def kb_uniqueizer_session_tpl_pick(rows: list[dict]) -> InlineKeyboardMarkup:
+    lines: list[list[InlineKeyboardButton]] = []
+    for row in rows:
+        tid = str(row.get("id") or "")
+        if not tid:
+            continue
+        nm = (row.get("name") or "Шаблон")[:30]
+        lines.append(
+            [
+                InlineKeyboardButton(
+                    text=nm,
+                    callback_data=f"{UCB}:uzsess:{tid}",
+                )
+            ]
+        )
+    lines.append([InlineKeyboardButton(text="⬅️ К выбору способа", callback_data=f"{UCB}:uzrmb")])
+    lines.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"{UCB}:uzhm")])
+    return InlineKeyboardMarkup(inline_keyboard=lines)
+
+
+def kb_uniqueizer_adhoc_build(levels: dict[str, int]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    row_buf: list[InlineKeyboardButton] = []
+    for key, label in UNIQUEIZER_OPTION_DEFS:
+        lv = _uz_level_clamp(int(levels.get(key) or 0))
+        tag = UNIQUEIZER_LEVEL_LABELS[lv]
+        short = (label[:14] + "…") if len(label) > 15 else label
+        row_buf.append(
+            InlineKeyboardButton(
+                text=f"{short} ·{tag}",
+                callback_data=f"{UCB}:uzcyc:{key}",
+            )
+        )
+        if len(row_buf) >= 2:
+            rows.append(row_buf)
+            row_buf = []
+    if row_buf:
+        rows.append(row_buf)
+    rows.append(
+        [InlineKeyboardButton(text="✅ Далее — загрузить файл", callback_data=f"{UCB}:uzadgo")],
+    )
+    rows.append([InlineKeyboardButton(text="⬅️ К выбору способа", callback_data=f"{UCB}:uzrmb")])
     rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"{UCB}:uzhm")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -2685,12 +2744,12 @@ def text_uniqueizer_screen_html() -> str:
         return raw
     return (
         "🎯 <b>Уникализатор</b>\n\n"
-        "• <b>Уникализация</b> — загрузите фото или видео, выберите шаблон (если ещё не выбран), "
-        "задайте число копий; бот вернёт ZIP с вариантами.\n"
-        "• <b>Шаблоны</b> — набор опций обработки; один шаблон отмечен ✓ и используется при уникализации.\n\n"
-        "<i><b>ffmpeg</b> подключается автоматически через пакет <code>imageio-ffmpeg</code> (уже в зависимостях). "
-        "При желании можно указать свой бинарник: <code>FFMPEG_PATH</code> или системный ffmpeg в PATH. "
-        "Если ffmpeg недоступен: видео в ZIP — дубликаты одного файла; фото — через Pillow.</i>"
+        "• <b>Уникализация</b> — сначала режим: <b>по шаблону</b> (любой из ваших на эту загрузку) "
+        "или <b>своя настройка</b> (без сохранения в базу), затем фото/видео и число копий; ответ — ZIP.\n"
+        "• <b>Шаблоны</b> — создать и хранить пресеты; ✓ — активный шаблон (удобно, если заходите сразу с медиа "
+        "без выбора режима — см. подсказки бота).\n\n"
+        "<i><b>ffmpeg</b> — пакет <code>imageio-ffmpeg</code>, опционально <code>FFMPEG_PATH</code> или бинарник в PATH. "
+        "Видео без ffmpeg не обрабатывается; фото при необходимости — через Pillow.</i>"
     )
 
 
@@ -4086,14 +4145,160 @@ async def cb_uniqueizer_home(query: CallbackQuery, state: FSMContext):
 async def cb_uniqueizer_run_start(query: CallbackQuery, state: FSMContext):
     if not await _uniqueizer_guard(query):
         return
-    await state.set_state(UniqueizerStates.uniq_media)
+    await state.set_state(UniqueizerStates.uniq_run_mode)
     await state.set_data({})
     await safe_edit_text(
         query.message,
         "📦 <b>Уникализация</b>\n\n"
-        "Отправьте <b>фото</b> или <b>видео</b> (можно как файл-документ).\n"
-        f"Максимум ~<b>{UNIQUEIZER_MAX_FILE_MB} МБ</b>.\n\n"
-        "Дальше при необходимости выберите шаблон и число копий.\n"
+        "Выберите способ:\n"
+        "• <b>По шаблону</b> — один из ваших сохранённых шаблонов "
+        "(для этой загрузки, без смены «активного» в разделе «Шаблоны»).\n"
+        "• <b>Своя настройка</b> — сила эффектов только для этого файла, в базу не сохраняется.\n\n"
+        "После выбора пришлите <b>фото</b> или <b>видео</b> "
+        "(документ image/* или video/*). "
+        f"Максимум ~<b>{UNIQUEIZER_MAX_FILE_MB} МБ</b>.\n"
+        "/cancel — отмена.",
+        parse_mode="HTML",
+        reply_markup=kb_uniqueizer_run_mode_pick(),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == f"{UCB}:uzrmb")
+async def cb_uniqueizer_run_menu_back(query: CallbackQuery, state: FSMContext):
+    """Возврат к экрану «шаблон / своя настройка»."""
+    if not await _uniqueizer_guard(query):
+        return
+    await state.set_state(UniqueizerStates.uniq_run_mode)
+    await state.set_data({})
+    await safe_edit_text(
+        query.message,
+        "📦 <b>Уникализация</b>\n\n"
+        "Выберите способ:\n"
+        "• <b>По шаблону</b> — сохранённый шаблон на эту загрузку.\n"
+        "• <b>Своя настройка</b> — параметры только для этого файла.\n\n"
+        "Затем пришлите фото или видео.\n"
+        f"Лимит ~<b>{UNIQUEIZER_MAX_FILE_MB} МБ</b>.",
+        parse_mode="HTML",
+        reply_markup=kb_uniqueizer_run_mode_pick(),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == f"{UCB}:uzpath:tpl")
+async def cb_uniqueizer_path_pick_template(query: CallbackQuery, state: FSMContext):
+    if not await _uniqueizer_guard(query):
+        return
+    if await state.get_state() != UniqueizerStates.uniq_run_mode:
+        await query.answer("Начните с «Уникализация».", show_alert=True)
+        return
+    uid = query.from_user.id
+    rows = uniqueizer_templates_list(uid)
+    await state.set_state(UniqueizerStates.uniq_pick_tpl)
+    if not rows:
+        await safe_edit_text(
+            query.message,
+            "📋 <b>Шаблоны</b>\n\n"
+            "У вас пока нет шаблонов. Создайте в разделе «Шаблоны» или нажмите кнопку ниже.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="➕ Создать шаблон", callback_data=f"{UCB}:uznew")],
+                    [InlineKeyboardButton(text="⬅️ К выбору способа", callback_data=f"{UCB}:uzrmb")],
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data=f"{UCB}:uzhm")],
+                ]
+            ),
+        )
+        await query.answer()
+        return
+    await safe_edit_text(
+        query.message,
+        "📋 <b>Шаблон для этой загрузки</b>\n\n"
+        "Выберите шаблон. Активный шаблон в меню «Шаблоны» при этом не меняется.",
+        parse_mode="HTML",
+        reply_markup=kb_uniqueizer_session_tpl_pick(rows),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == f"{UCB}:uzpath:adhoc")
+async def cb_uniqueizer_path_adhoc(query: CallbackQuery, state: FSMContext):
+    if not await _uniqueizer_guard(query):
+        return
+    if await state.get_state() != UniqueizerStates.uniq_run_mode:
+        await query.answer("Начните с «Уникализация».", show_alert=True)
+        return
+    await state.set_state(UniqueizerStates.uniq_adhoc_build)
+    await state.update_data(uz_adhoc_levels=_uz_tpl_levels_empty())
+    await safe_edit_text(
+        query.message,
+        "⚙️ <b>Своя настройка</b> (только эта загрузка)\n\n"
+        "Нажимайте кнопки: цикл <b>выкл → слабо → средне → сильно</b>.\n"
+        "Затем <b>Далее — загрузить файл</b> и пришлите фото или видео.",
+        parse_mode="HTML",
+        reply_markup=kb_uniqueizer_adhoc_build(_uz_tpl_levels_empty()),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data.startswith(f"{UCB}:uzsess:"))
+async def cb_uniqueizer_session_template_chosen(query: CallbackQuery, state: FSMContext):
+    if not await _uniqueizer_guard(query):
+        return
+    if await state.get_state() != UniqueizerStates.uniq_pick_tpl:
+        await query.answer("Сначала выберите способ «По шаблону».", show_alert=True)
+        return
+    parts = (query.data or "").split(":")
+    if len(parts) < 3:
+        await query.answer()
+        return
+    tpl_id = parts[2]
+    uid = query.from_user.id
+    row = uniqueizer_template_get_row(tpl_id)
+    if not row or int(row.get("telegram_id") or 0) != uid:
+        await query.answer("Шаблон недоступен.", show_alert=True)
+        return
+    nm = esc_html((row.get("name") or "Шаблон")[:80])
+    await state.set_state(UniqueizerStates.uniq_media)
+    await state.update_data(
+        uz_template_id=tpl_id,
+        uz_use_adhoc=False,
+        uz_adhoc_levels=None,
+    )
+    await safe_edit_text(
+        query.message,
+        f"📦 Шаблон: <b>{nm}</b>\n\n"
+        "Пришлите <b>фото</b> или <b>видео</b> "
+        f"(до ~{UNIQUEIZER_MAX_FILE_MB} МБ).\n"
+        "/cancel — отмена.",
+        parse_mode="HTML",
+        reply_markup=kb_uniqueizer_cancel_hub(),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == f"{UCB}:uzadgo")
+async def cb_uniqueizer_adhoc_proceed_media(query: CallbackQuery, state: FSMContext):
+    if not await _uniqueizer_guard(query):
+        return
+    if await state.get_state() != UniqueizerStates.uniq_adhoc_build:
+        await query.answer()
+        return
+    data = await state.get_data()
+    levels = dict(data.get("uz_adhoc_levels") or _uz_tpl_levels_empty())
+    await state.set_state(UniqueizerStates.uniq_media)
+    await state.update_data(
+        uz_use_adhoc=True,
+        uz_adhoc_levels=levels,
+        uz_template_id=None,
+    )
+    n_on = sum(1 for v in levels.values() if int(v or 0) > 0)
+    await safe_edit_text(
+        query.message,
+        "⚙️ <b>Своя настройка</b> сохранена для этой загрузки "
+        f"(опций &gt; 0: <b>{n_on}</b>).\n\n"
+        "Пришлите <b>фото</b> или <b>видео</b> "
+        f"(до ~{UNIQUEIZER_MAX_FILE_MB} МБ).\n"
         "/cancel — отмена.",
         parse_mode="HTML",
         reply_markup=kb_uniqueizer_cancel_hub(),
@@ -4157,20 +4362,29 @@ async def cb_uniqueizer_tpl_new(query: CallbackQuery, state: FSMContext):
 async def cb_uniqueizer_tpl_cycle_level(query: CallbackQuery, state: FSMContext):
     if not await _uniqueizer_guard(query):
         return
-    if await state.get_state() != UniqueizerStates.tpl_build:
-        await query.answer("Сначала создайте шаблон.", show_alert=True)
+    cur_st = await state.get_state()
+    if cur_st not in (UniqueizerStates.tpl_build, UniqueizerStates.uniq_adhoc_build):
+        await query.answer("Сначала откройте настройки шаблона или «Своя настройка».", show_alert=True)
         return
     key = (query.data or "").split(":")[-1]
     if key not in UNIQUEIZER_OPTION_KEYS:
         await query.answer()
         return
     data = await state.get_data()
-    levels: dict[str, int] = dict(data.get("uz_tpl_levels") or _uz_tpl_levels_empty())
-    cur = _uz_level_clamp(int(levels.get(key) or 0))
-    levels[key] = (cur + 1) % 4
-    await state.update_data(uz_tpl_levels=levels)
+    if cur_st == UniqueizerStates.tpl_build:
+        levels: dict[str, int] = dict(data.get("uz_tpl_levels") or _uz_tpl_levels_empty())
+        cur = _uz_level_clamp(int(levels.get(key) or 0))
+        levels[key] = (cur + 1) % 4
+        await state.update_data(uz_tpl_levels=levels)
+        kb = kb_uniqueizer_tpl_build(levels)
+    else:
+        levels = dict(data.get("uz_adhoc_levels") or _uz_tpl_levels_empty())
+        cur = _uz_level_clamp(int(levels.get(key) or 0))
+        levels[key] = (cur + 1) % 4
+        await state.update_data(uz_adhoc_levels=levels)
+        kb = kb_uniqueizer_adhoc_build(levels)
     try:
-        await query.message.edit_reply_markup(reply_markup=kb_uniqueizer_tpl_build(levels))
+        await query.message.edit_reply_markup(reply_markup=kb)
     except TelegramBadRequest:
         pass
     await query.answer(UNIQUEIZER_LEVEL_LABELS[levels[key]])
@@ -4226,7 +4440,12 @@ async def cb_uniqueizer_tpl_select(query: CallbackQuery, state: FSMContext):
         is_vid = bool(data.get("uz_is_video"))
         if mpath and os.path.isfile(mpath):
             await state.set_state(UniqueizerStates.uniq_copies)
-            await state.update_data(uz_template_id=tpl_id, uz_media_path=mpath, uz_is_video=is_vid)
+            await state.update_data(
+                uz_template_id=tpl_id,
+                uz_media_path=mpath,
+                uz_is_video=is_vid,
+                uz_use_adhoc=False,
+            )
             nm = esc_html((row.get("name") or "Шаблон")[:60])
             await safe_edit_text(
                 query.message,
@@ -4264,8 +4483,11 @@ async def cb_uniqueizer_do_copies(query: CallbackQuery, state: FSMContext):
         await query.answer("Файл не найден. Начните снова.", show_alert=True)
         await state.clear()
         return
-    row = uniqueizer_template_get_row(str(tpl_id)) if tpl_id else None
-    tpl_levels = _template_levels_from_row(row) if row else _uz_tpl_levels_empty()
+    if data.get("uz_use_adhoc"):
+        tpl_levels = dict(data.get("uz_adhoc_levels") or _uz_tpl_levels_empty())
+    else:
+        row = uniqueizer_template_get_row(str(tpl_id)) if tpl_id else None
+        tpl_levels = _template_levels_from_row(row) if row else _uz_tpl_levels_empty()
     await query.answer("⏳ Обрабатываю…")
     try:
         zip_p, err = await asyncio.to_thread(
@@ -4377,6 +4599,39 @@ async def uniqueizer_receive_media(message: Message, state: FSMContext):
         await message.answer(f"Не удалось скачать файл: {esc_html(err or 'ошибка')}", parse_mode="HTML")
         return
 
+    data = await state.get_data()
+    if data.get("uz_use_adhoc"):
+        await state.set_state(UniqueizerStates.uniq_copies)
+        await state.update_data(uz_media_path=path, uz_is_video=is_video)
+        n_on = sum(1 for v in (data.get("uz_adhoc_levels") or {}).values() if int(v or 0) > 0)
+        await message.answer(
+            f"⚙️ <b>Своя настройка</b> (опций &gt; 0: {n_on}).\n\n"
+            "Сколько <b>копий</b> сделать?",
+            parse_mode="HTML",
+            reply_markup=kb_uniqueizer_copies_pick(),
+        )
+        return
+
+    sess_tid = data.get("uz_template_id")
+    if sess_tid:
+        row = uniqueizer_template_get_row(str(sess_tid))
+        if row and int(row.get("telegram_id") or 0) == uid:
+            await state.set_state(UniqueizerStates.uniq_copies)
+            await state.update_data(
+                uz_media_path=path,
+                uz_is_video=is_video,
+                uz_template_id=str(sess_tid),
+                uz_use_adhoc=False,
+            )
+            nm = esc_html((row.get("name") or "Шаблон")[:60])
+            await message.answer(
+                f"Шаблон: <b>{nm}</b>\n\n"
+                "Сколько <b>копий</b> сделать?",
+                parse_mode="HTML",
+                reply_markup=kb_uniqueizer_copies_pick(),
+            )
+            return
+
     u = user_get(uid)
     sel = _user_uniqueizer_selected_template_id(u)
     if not sel:
@@ -4411,7 +4666,12 @@ async def uniqueizer_receive_media(message: Message, state: FSMContext):
         return
 
     await state.set_state(UniqueizerStates.uniq_copies)
-    await state.update_data(uz_media_path=path, uz_is_video=is_video, uz_template_id=sel)
+    await state.update_data(
+        uz_media_path=path,
+        uz_is_video=is_video,
+        uz_template_id=sel,
+        uz_use_adhoc=False,
+    )
     nm = esc_html((row.get("name") or "Шаблон")[:60])
     await message.answer(
         f"Шаблон: <b>{nm}</b>\n\n"
@@ -4430,6 +4690,42 @@ async def uniqueizer_media_hint_text(message: Message, state: FSMContext):
         return
     await message.answer(
         "Пришлите <b>фото</b> или <b>видео</b> (или документ image/* / video/*).",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(
+    StateFilter(
+        UniqueizerStates.uniq_run_mode,
+        UniqueizerStates.uniq_pick_tpl,
+        UniqueizerStates.uniq_adhoc_build,
+    ),
+    F.text,
+)
+async def uniqueizer_preflow_text(message: Message, state: FSMContext):
+    if not user_has_active_uniqueizer_plan(message.from_user.id):
+        await state.clear()
+        return
+    if (message.text or "").strip().startswith("/"):
+        return
+    await message.answer("Для этого шага используйте <b>кнопки</b> под сообщением бота.", parse_mode="HTML")
+
+
+@dp.message(
+    StateFilter(
+        UniqueizerStates.uniq_run_mode,
+        UniqueizerStates.uniq_pick_tpl,
+        UniqueizerStates.uniq_adhoc_build,
+    ),
+    F.photo | F.video | F.video_note | F.document,
+)
+async def uniqueizer_preflow_media_early(message: Message, state: FSMContext):
+    if not user_has_active_uniqueizer_plan(message.from_user.id):
+        await state.clear()
+        return
+    await message.answer(
+        "Сначала выберите <b>По шаблону</b> или <b>Своя настройку</b>, "
+        "затем шаблон или «Далее — загрузить файл» — и только после этого пришлите медиа.",
         parse_mode="HTML",
     )
 
