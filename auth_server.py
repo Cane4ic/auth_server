@@ -33,6 +33,8 @@ from aiogram.types import (
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaDocument,
+    InputMediaPhoto,
     Message,
 )
 from fastapi import FastAPI, HTTPException, Request
@@ -278,6 +280,208 @@ async def safe_edit_text(message: Message, text: str, **kwargs) -> None:
             )
             return
         raise
+
+
+# Один якорный пост на пользователя: правим caption/media вместо ленты новых сообщений.
+# file_id кэшируется после первой загрузки — повторные экраны не перезаливают файл на серверы Telegram.
+_USER_SHELL_ANCHOR: dict[int, tuple[int, int]] = {}
+_USER_SHELL_MEDIA_FILE_IDS: dict[str, str] = {}
+
+
+def _user_shell_uid(telegram_user_id: Optional[int], chat_id: int) -> int:
+    return int(telegram_user_id) if telegram_user_id is not None else int(chat_id)
+
+
+def _user_shell_coords(user_id: int, base_msg: Optional[Message]) -> Optional[tuple[int, int]]:
+    if base_msg:
+        return (base_msg.chat.id, base_msg.message_id)
+    return _USER_SHELL_ANCHOR.get(user_id)
+
+
+async def user_shell_apply_photo(
+    bot: Bot,
+    user_id: int,
+    chat_id: int,
+    base_msg: Optional[Message],
+    *,
+    cache_key: str,
+    photo_source: object,
+    caption: str,
+    parse_mode: Optional[str],
+    reply_markup: InlineKeyboardMarkup,
+) -> None:
+    coords = _user_shell_coords(user_id, base_msg)
+    cap = caption.strip() if caption.strip() else "."
+    media_val: object = _USER_SHELL_MEDIA_FILE_IDS.get(cache_key) or photo_source
+    if coords:
+        cid, mid = coords
+        try:
+            m = await bot.edit_message_media(
+                chat_id=cid,
+                message_id=mid,
+                media=InputMediaPhoto(media=media_val, caption=cap, parse_mode=parse_mode),
+                reply_markup=reply_markup,
+            )
+            if m.photo:
+                _USER_SHELL_MEDIA_FILE_IDS[cache_key] = m.photo[-1].file_id
+            _USER_SHELL_ANCHOR[user_id] = (cid, mid)
+            return
+        except TelegramBadRequest as e:
+            err = str(e).lower()
+            if "message is not modified" in err:
+                return
+            try:
+                await bot.delete_message(chat_id=cid, message_id=mid)
+            except Exception:
+                pass
+            _USER_SHELL_ANCHOR.pop(user_id, None)
+    m = await bot.send_photo(
+        chat_id=chat_id,
+        photo=photo_source,
+        caption=caption if caption.strip() else None,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+    )
+    _USER_SHELL_ANCHOR[user_id] = (chat_id, m.message_id)
+    if m.photo:
+        _USER_SHELL_MEDIA_FILE_IDS[cache_key] = m.photo[-1].file_id
+
+
+async def user_shell_apply_document(
+    bot: Bot,
+    user_id: int,
+    chat_id: int,
+    base_msg: Optional[Message],
+    *,
+    cache_key: str,
+    document_source: object,
+    caption: str,
+    parse_mode: Optional[str],
+    reply_markup: InlineKeyboardMarkup,
+) -> None:
+    coords = _user_shell_coords(user_id, base_msg)
+    cap = caption.strip() if caption.strip() else "."
+    media_val: object = _USER_SHELL_MEDIA_FILE_IDS.get(cache_key) or document_source
+    if coords:
+        cid, mid = coords
+        try:
+            m = await bot.edit_message_media(
+                chat_id=cid,
+                message_id=mid,
+                media=InputMediaDocument(media=media_val, caption=cap, parse_mode=parse_mode),
+                reply_markup=reply_markup,
+            )
+            if m.document:
+                _USER_SHELL_MEDIA_FILE_IDS[cache_key] = m.document.file_id
+            _USER_SHELL_ANCHOR[user_id] = (cid, mid)
+            return
+        except TelegramBadRequest as e:
+            err = str(e).lower()
+            if "message is not modified" in err:
+                return
+            try:
+                await bot.delete_message(chat_id=cid, message_id=mid)
+            except Exception:
+                pass
+            _USER_SHELL_ANCHOR.pop(user_id, None)
+    m = await bot.send_document(
+        chat_id=chat_id,
+        document=document_source,
+        caption=caption if caption.strip() else None,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+    )
+    _USER_SHELL_ANCHOR[user_id] = (chat_id, m.message_id)
+    if m.document:
+        _USER_SHELL_MEDIA_FILE_IDS[cache_key] = m.document.file_id
+
+
+async def user_shell_apply_text(
+    bot: Bot,
+    user_id: int,
+    chat_id: int,
+    base_msg: Optional[Message],
+    *,
+    text: str,
+    parse_mode: Optional[str],
+    reply_markup: InlineKeyboardMarkup,
+) -> None:
+    """Текст без медиа. Если якорь был с фото/документом — удаляем и шлём текст."""
+    out = text.strip() if text.strip() else "."
+    coords = _user_shell_coords(user_id, base_msg)
+    if coords:
+        cid, mid = coords
+        try:
+            await bot.edit_message_text(
+                chat_id=cid,
+                message_id=mid,
+                text=out,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+            )
+            _USER_SHELL_ANCHOR[user_id] = (cid, mid)
+            return
+        except TelegramBadRequest as e:
+            err = str(e).lower()
+            if "message is not modified" in err:
+                return
+            try:
+                await bot.delete_message(chat_id=cid, message_id=mid)
+            except Exception:
+                pass
+            _USER_SHELL_ANCHOR.pop(user_id, None)
+    m = await bot.send_message(
+        chat_id=chat_id,
+        text=out,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+    )
+    _USER_SHELL_ANCHOR[user_id] = (chat_id, m.message_id)
+
+
+async def user_shell_try_edit_caption(
+    bot: Bot,
+    user_id: int,
+    chat_id: int,
+    caption: str,
+    *,
+    parse_mode: Optional[str],
+    reply_markup: InlineKeyboardMarkup,
+) -> bool:
+    t = _USER_SHELL_ANCHOR.get(user_id)
+    if not t or t[0] != chat_id:
+        return False
+    _, mid = t
+    cap = caption.strip() if caption.strip() else "."
+    try:
+        await bot.edit_message_caption(
+            chat_id=chat_id,
+            message_id=mid,
+            caption=cap,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+        )
+        return True
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e).lower():
+            return True
+        return False
+
+
+async def user_shell_answer_or_edit(
+    message: Message,
+    *,
+    text: str,
+    parse_mode: Optional[str],
+    reply_markup: InlineKeyboardMarkup,
+) -> None:
+    """Ответ на ввод: правим якорное сообщение; иначе — новое."""
+    uid = message.from_user.id
+    if await user_shell_try_edit_caption(
+        message.bot, uid, message.chat.id, text, parse_mode=parse_mode, reply_markup=reply_markup
+    ):
+        return
+    await message.answer(text, parse_mode=parse_mode, reply_markup=reply_markup)
 
 
 @dp.errors()
@@ -2305,52 +2509,60 @@ def referrals_photo_for_new_message() -> Optional[object]:
 
 
 async def show_user_referrals_screen(query: CallbackQuery) -> None:
-    """Экран рефералов: отдельное фото или правка текста/подписи."""
-    text = await build_referrals_user_html(query.from_user.id)
+    """Экран рефералов: одно якорное сообщение (фото + подпись или правка текста)."""
+    uid = query.from_user.id
+    chat_id = query.message.chat.id
+    text = await build_referrals_user_html(uid)
     markup = kb_referrals_screen()
     img = referrals_photo_for_new_message()
     if img:
-        chat_id = query.message.chat.id
         try:
-            await query.message.delete()
-        except Exception:
-            pass
-        await query.bot.send_photo(
-            chat_id=chat_id,
-            photo=img,
-            caption=text,
-            parse_mode="HTML",
-            reply_markup=markup,
-        )
-    else:
-        await safe_edit_text(query.message, text, parse_mode="HTML", reply_markup=markup)
-
-
-async def show_user_profile_screen(query: CallbackQuery) -> None:
-    """Профиль: фото или документ с подписью (как рефералы/тарифы), иначе правка текста."""
-    tid = query.from_user.id
-    u = user_get(tid)
-    text = build_user_profile_public_text(tid, u)
-    markup = kb_user_back_main()
-    photo = profile_photo_for_new_message()
-    chat_id = query.message.chat.id
-    if photo:
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
-        try:
-            await query.bot.send_photo(
-                chat_id=chat_id,
-                photo=photo,
+            await user_shell_apply_photo(
+                query.bot,
+                uid,
+                chat_id,
+                query.message,
+                cache_key="shell_referrals",
+                photo_source=img,
                 caption=text,
                 parse_mode="HTML",
                 reply_markup=markup,
             )
         except Exception as e:
-            print(f"profile photo send failed: {e}")
-            await query.bot.send_message(
-                chat_id=chat_id,
+            print(f"referrals photo shell failed: {e}")
+            await safe_edit_text(query.message, text, parse_mode="HTML", reply_markup=markup)
+    else:
+        await safe_edit_text(query.message, text, parse_mode="HTML", reply_markup=markup)
+
+
+async def show_user_profile_screen(query: CallbackQuery) -> None:
+    """Профиль: одно якорное сообщение."""
+    tid = query.from_user.id
+    chat_id = query.message.chat.id
+    u = user_get(tid)
+    text = build_user_profile_public_text(tid, u)
+    markup = kb_user_back_main()
+    photo = profile_photo_for_new_message()
+    if photo:
+        try:
+            await user_shell_apply_photo(
+                query.bot,
+                tid,
+                chat_id,
+                query.message,
+                cache_key="shell_profile_photo",
+                photo_source=photo,
+                caption=text,
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+        except Exception as e:
+            print(f"profile photo shell failed: {e}")
+            await user_shell_apply_text(
+                query.bot,
+                tid,
+                chat_id,
+                query.message,
                 text=text,
                 parse_mode="HTML",
                 reply_markup=markup,
@@ -2359,21 +2571,24 @@ async def show_user_profile_screen(query: CallbackQuery) -> None:
     doc = profile_document_for_new_message()
     if doc:
         try:
-            await query.message.delete()
-        except Exception:
-            pass
-        try:
-            await query.bot.send_document(
-                chat_id=chat_id,
-                document=doc,
+            await user_shell_apply_document(
+                query.bot,
+                tid,
+                chat_id,
+                query.message,
+                cache_key="shell_profile_document",
+                document_source=doc,
                 caption=text,
                 parse_mode="HTML",
                 reply_markup=markup,
             )
         except Exception as e:
-            print(f"profile document send failed: {e}")
-            await query.bot.send_message(
-                chat_id=chat_id,
+            print(f"profile document shell failed: {e}")
+            await user_shell_apply_text(
+                query.bot,
+                tid,
+                chat_id,
+                query.message,
                 text=text,
                 parse_mode="HTML",
                 reply_markup=markup,
@@ -2389,99 +2604,99 @@ async def show_user_main_menu(
     extra_caption: str = "",
     telegram_user_id: Optional[int] = None,
     telegram_username: Optional[str] = None,
+    anchor_message: Optional[Message] = None,
 ) -> None:
-    """Главное меню: вместо текста — картинка (send_document) + inline-кнопки.
-    При переданном telegram_user_id — запись в users (первый доступ после канала и политик)."""
-    # До проверки bot: иначе при BOT_TOKEN не задан insert в users не выполнялся бы.
+    """Главное меню: одно якорное сообщение (фото/документ/текст) + кнопки."""
     if telegram_user_id is not None:
         ensure_user_row_from_bot(telegram_user_id, telegram_username)
     if not bot_obj:
         return
+    uid = _user_shell_uid(telegram_user_id, chat_id)
     extra_caption = (extra_caption or "").strip()
+    markup = kb_user_main_menu(telegram_user_id)
+    pm: Optional[str] = "Markdown" if extra_caption else None
+    cap = extra_caption if extra_caption else "."
     photo = main_menu_photo_for_new_message()
     if photo:
         try:
-            await bot_obj.send_photo(
-                chat_id=chat_id,
-                photo=photo,
-                caption=extra_caption or None,
-                parse_mode="Markdown",
-                reply_markup=kb_user_main_menu(telegram_user_id),
+            await user_shell_apply_photo(
+                bot_obj,
+                uid,
+                chat_id,
+                anchor_message,
+                cache_key="shell_main_photo",
+                photo_source=photo,
+                caption=cap,
+                parse_mode=pm,
+                reply_markup=markup,
             )
             return
         except Exception as e:
-            print(f"main menu send_photo failed: {e}")
+            print(f"main menu photo shell failed: {e}")
     doc = main_menu_document_for_new_message()
     if doc:
         try:
-            await bot_obj.send_document(
-                chat_id=chat_id,
-                document=doc,
-                caption=extra_caption or None,
-                parse_mode="Markdown",
-                reply_markup=kb_user_main_menu(telegram_user_id),
+            await user_shell_apply_document(
+                bot_obj,
+                uid,
+                chat_id,
+                anchor_message,
+                cache_key="shell_main_document",
+                document_source=doc,
+                caption=cap,
+                parse_mode=pm,
+                reply_markup=markup,
             )
             return
         except Exception as e:
-            print(f"main menu send_document failed: {e}")
-    # Telegram: text не может быть пустым; NBSP/пробел иногда отклоняются — ставим видимый символ.
+            print(f"main menu document shell failed: {e}")
     text_out = extra_caption if extra_caption else "."
     if not text_out.strip():
         text_out = "."
-    await bot_obj.send_message(
-        chat_id=chat_id,
+    await user_shell_apply_text(
+        bot_obj,
+        uid,
+        chat_id,
+        anchor_message,
         text=text_out,
-        parse_mode="Markdown" if extra_caption else None,
-        reply_markup=kb_user_main_menu(telegram_user_id),
+        parse_mode=pm,
+        reply_markup=markup,
     )
 
 
 async def _show_tariffs_text_fallback(
     query: CallbackQuery, caption: str, markup: InlineKeyboardMarkup
 ) -> None:
-    chat_id = query.message.chat.id
-    if query.message.photo:
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
-        await query.bot.send_message(
-            chat_id=chat_id,
-            text=caption,
-            parse_mode="HTML",
-            reply_markup=markup,
-        )
-    else:
-        await safe_edit_text(query.message,
-            text=caption,
-            parse_mode="HTML",
-            reply_markup=markup,
-        )
+    await safe_edit_text(
+        query.message,
+        caption,
+        parse_mode="HTML",
+        reply_markup=markup,
+    )
 
 
 async def show_user_tariffs_screen(query: CallbackQuery) -> None:
+    uid = query.from_user.id
+    chat_id = query.message.chat.id
     caption = text_tariffs_caption_html()
     markup = kb_tariffs()
     img = tariffs_photo_for_new_message()
 
     if img:
         try:
-            # Нельзя только edit_caption, если текущее сообщение — фото главного меню:
-            # картинка останется прежней. Удаляем и шлём новое с TARIFFS_IMAGE_*.
-            chat_id = query.message.chat.id
-            try:
-                await query.message.delete()
-            except Exception:
-                pass
-            await query.bot.send_photo(
-                chat_id=chat_id,
-                photo=img,
+            await user_shell_apply_photo(
+                query.bot,
+                uid,
+                chat_id,
+                query.message,
+                cache_key="shell_tariffs",
+                photo_source=img,
                 caption=caption,
                 parse_mode="HTML",
                 reply_markup=markup,
             )
         except Exception as e:
-            print(f"tariffs photo failed: {e}")
+            print(f"tariffs photo shell failed: {e}")
             await _show_tariffs_text_fallback(query, caption, markup)
     else:
         await _show_tariffs_text_fallback(query, caption, markup)
@@ -2493,26 +2708,14 @@ async def require_policies_or_block(query: CallbackQuery) -> bool:
     uid = query.from_user.id
     if is_admin(uid) or policies_user_has_accepted(uid):
         return True
-    chat_id = query.message.chat.id
     prompt = text_policies_prompt_html()
     markup = kb_policies_accept()
-    if query.message.photo:
-        try:
-            await query.message.delete()
-        except Exception:
-            pass
-        await query.bot.send_message(
-            chat_id=chat_id,
-            text=prompt,
-            parse_mode="HTML",
-            reply_markup=markup,
-        )
-    else:
-        await safe_edit_text(query.message,
-            text=prompt,
-            parse_mode="HTML",
-            reply_markup=markup,
-        )
+    await safe_edit_text(
+        query.message,
+        prompt,
+        parse_mode="HTML",
+        reply_markup=markup,
+    )
     await query.answer("Сначала примите условия.", show_alert=True)
     return False
 
@@ -2560,6 +2763,7 @@ async def cmd_start(message: Message):
             extra_caption=extra or "",
             telegram_user_id=uid,
             telegram_username=message.from_user.username if message.from_user else None,
+            anchor_message=message,
         )
         return
 
@@ -2694,16 +2898,13 @@ async def cb_policies_accept(query: CallbackQuery):
     uid = query.from_user.id
     record_policies_acceptance(uid)
     extra = "\n\n🔐 /admin — панель администратора." if is_admin(uid) else ""
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
     await show_user_main_menu(
         query.bot,
         query.message.chat.id,
         extra_caption=extra or "",
         telegram_user_id=uid,
         telegram_username=query.from_user.username if query.from_user else None,
+        anchor_message=query.message,
     )
     await query.answer("Доступ к боту открыт.")
 
@@ -2724,16 +2925,13 @@ async def cb_user_channel_recheck(query: CallbackQuery):
         await query.answer("Канал подтверждён. Осталось принять условия.")
         return
     extra = "\n\n🔐 /admin — панель администратора." if is_admin(uid) else ""
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
     await show_user_main_menu(
         query.bot,
         query.message.chat.id,
         extra_caption=extra or "",
         telegram_user_id=uid,
         telegram_username=query.from_user.username if query.from_user else None,
+        anchor_message=query.message,
     )
     await query.answer("✅ Подписка подтверждена!")
 
@@ -2746,36 +2944,22 @@ async def cb_user_back_main(query: CallbackQuery, state: FSMContext):
     if not is_admin(uid) and not policies_user_has_accepted(uid):
         prompt = text_policies_prompt_html()
         markup = kb_policies_accept()
-        if query.message.photo:
-            try:
-                await query.message.delete()
-            except Exception:
-                pass
-            await query.bot.send_message(
-                chat_id=chat_id,
-                text=prompt,
-                parse_mode="HTML",
-                reply_markup=markup,
-            )
-        else:
-            await safe_edit_text(query.message,
-                text=prompt,
-                parse_mode="HTML",
-                reply_markup=markup,
-            )
+        await safe_edit_text(
+            query.message,
+            prompt,
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
         await query.answer()
         return
     extra = "\n\n🔐 /admin — панель администратора." if is_admin(uid) else ""
-    try:
-        await query.message.delete()
-    except Exception:
-        pass
     await show_user_main_menu(
         query.bot,
         chat_id,
         extra_caption=extra or "",
         telegram_user_id=uid,
         telegram_username=query.from_user.username if query.from_user else None,
+        anchor_message=query.message,
     )
     await query.answer()
 
@@ -2913,45 +3097,53 @@ async def cb_user_profile_menu(query: CallbackQuery):
 async def cb_user_reviews_placeholder(query: CallbackQuery):
     if not await require_policies_or_block(query):
         return
+    uid = query.from_user.id
+    chat_id = query.message.chat.id
+    markup = kb_user_back_main()
     photo = reviews_photo_for_new_message()
     doc = None if photo else reviews_document_for_new_message()
+    cap_rev = os.environ.get(
+        "TEXT_REVIEWS",
+        "⭐ **Отзывы**\n\nЗдесь будет ссылка на отзывы или канал. Укажите `LINK_REVIEWS` в настройках.",
+    )
     if photo:
         try:
-            await query.message.delete()
-        except Exception:
-            pass
-        try:
-            await query.bot.send_photo(
-                chat_id=query.message.chat.id,
-                photo=photo,
-                caption=None,
-                reply_markup=kb_user_back_main(),
+            await user_shell_apply_photo(
+                query.bot,
+                uid,
+                chat_id,
+                query.message,
+                cache_key="shell_reviews",
+                photo_source=photo,
+                caption=cap_rev,
+                parse_mode="Markdown",
+                reply_markup=markup,
             )
         except Exception as e:
-            print(f"reviews photo send failed: {e}")
+            print(f"reviews photo shell failed: {e}")
+            await safe_edit_text(query.message, cap_rev, parse_mode="Markdown", reply_markup=markup)
     elif doc:
         try:
-            await query.message.delete()
-        except Exception:
-            pass
-        try:
-            await query.bot.send_document(
-                chat_id=query.message.chat.id,
-                document=doc,
-                caption=None,
-                reply_markup=kb_user_back_main(),
+            await user_shell_apply_document(
+                query.bot,
+                uid,
+                chat_id,
+                query.message,
+                cache_key="shell_reviews_doc",
+                document_source=doc,
+                caption=cap_rev,
+                parse_mode="Markdown",
+                reply_markup=markup,
             )
         except Exception as e:
-            print(f"reviews document send failed: {e}")
+            print(f"reviews document shell failed: {e}")
+            await safe_edit_text(query.message, cap_rev, parse_mode="Markdown", reply_markup=markup)
     else:
-        text = os.environ.get(
-            "TEXT_REVIEWS",
-            "⭐ **Отзывы**\n\nЗдесь будет ссылка на отзывы или канал. Укажите `LINK_REVIEWS` в настройках.",
-        )
-        await safe_edit_text(query.message,
-            text,
+        await safe_edit_text(
+            query.message,
+            cap_rev,
             parse_mode="Markdown",
-            reply_markup=kb_user_back_main(),
+            reply_markup=markup,
         )
     await query.answer()
 
@@ -3171,19 +3363,28 @@ async def cb_user_tariff_plan(query: CallbackQuery):
                 )
     markup = kb_tariff_subplan_detail(code)
     plan_img = tariff_plan_photo_for_plan(code)
+    chat_id = query.message.chat.id
     if plan_img:
-        chat_id = query.message.chat.id
         try:
-            await query.message.delete()
-        except Exception:
-            pass
-        await query.bot.send_photo(
-            chat_id=chat_id,
-            photo=plan_img,
-            caption=sub_text,
-            parse_mode="HTML",
-            reply_markup=markup,
-        )
+            await user_shell_apply_photo(
+                query.bot,
+                uid,
+                chat_id,
+                query.message,
+                cache_key=f"shell_plan_{code}",
+                photo_source=plan_img,
+                caption=sub_text,
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+        except Exception as e:
+            print(f"tariff plan photo shell failed: {e}")
+            await safe_edit_text(
+                query.message,
+                sub_text,
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
     else:
         await safe_edit_text(
             query.message,
@@ -3321,6 +3522,39 @@ async def build_referrals_user_html(uid: int) -> str:
     return "\n".join(lines)
 
 
+async def user_shell_refresh_referrals(
+    bot: Bot,
+    uid: int,
+    chat_id: int,
+    *,
+    prefix_html: str = "",
+) -> None:
+    """Обновить якорь экраном рефералов (после /cancel, вывода и т.п.)."""
+    text = await build_referrals_user_html(uid)
+    full = (prefix_html.rstrip() + "\n\n" + text) if prefix_html.strip() else text
+    markup = kb_referrals_screen()
+    img = referrals_photo_for_new_message()
+    if img:
+        await user_shell_apply_photo(
+            bot,
+            uid,
+            chat_id,
+            None,
+            cache_key="shell_referrals",
+            photo_source=img,
+            caption=full,
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
+    else:
+        if not await user_shell_try_edit_caption(
+            bot, uid, chat_id, full, parse_mode="HTML", reply_markup=markup
+        ):
+            await bot.send_message(
+                chat_id, full, parse_mode="HTML", reply_markup=markup
+            )
+
+
 @dp.callback_query(F.data == f"{UCB}:referrals")
 async def cb_user_referrals(query: CallbackQuery):
     if not await require_policies_or_block(query):
@@ -3368,6 +3602,7 @@ async def cb_user_referral_withdraw_cancel(query: CallbackQuery, state: FSMConte
 @dp.message(UserReferralWithdrawStates.amount, F.text)
 async def process_referral_withdraw_amount(message: Message, state: FSMContext):
     uid = message.from_user.id
+    chat_id = message.chat.id
     if not is_admin(uid) and not policies_user_has_accepted(uid):
         await state.clear()
         return
@@ -3375,31 +3610,47 @@ async def process_referral_withdraw_amount(message: Message, state: FSMContext):
     try:
         amt = float(raw)
     except ValueError:
-        await message.answer(
-            "Введите число, например <code>10</code> или <code>25.5</code>.",
+        await user_shell_answer_or_edit(
+            message,
+            text="Введите число, например <code>10</code> или <code>25.5</code>.",
             parse_mode="HTML",
+            reply_markup=kb_referrals_withdraw_cancel(),
         )
         return
     min_w = get_referral_min_withdraw_usd()
     if amt < min_w - 1e-9:
-        await message.answer(
-            f"Минимальная сумма вывода — <b>{min_w:g}</b> USD.",
+        await user_shell_answer_or_edit(
+            message,
+            text=f"Минимальная сумма вывода — <b>{min_w:g}</b> USD.",
             parse_mode="HTML",
+            reply_markup=kb_referrals_withdraw_cancel(),
         )
         return
     if amt <= 0:
-        await message.answer("Сумма должна быть больше нуля.", parse_mode="HTML")
+        await user_shell_answer_or_edit(
+            message,
+            text="Сумма должна быть больше нуля.",
+            parse_mode="HTML",
+            reply_markup=kb_referrals_withdraw_cancel(),
+        )
         return
     avail = await referral_available_usd(uid)
     if amt > avail + 1e-6:
-        await message.answer(
-            f"Недостаточно средств. Доступно: <b>{avail:.2f}</b> USD.",
+        await user_shell_answer_or_edit(
+            message,
+            text=f"Недостаточно средств. Доступно: <b>{avail:.2f}</b> USD.",
             parse_mode="HTML",
+            reply_markup=kb_referrals_withdraw_cancel(),
         )
         return
     url, err, check_id = await crypto_pay_create_check_usdt(amt, uid)
     if err or not url:
-        await message.answer(esc_html(err or "Не удалось создать чек."), parse_mode="HTML")
+        await user_shell_answer_or_edit(
+            message,
+            text=esc_html(err or "Не удалось создать чек."),
+            parse_mode="HTML",
+            reply_markup=kb_referrals_withdraw_cancel(),
+        )
         return
     now = int(time.time())
     try:
@@ -3415,10 +3666,14 @@ async def process_referral_withdraw_amount(message: Message, state: FSMContext):
         ).execute()
     except Exception as e:
         print(f"referral_withdrawals insert failed: {e}")
-        await message.answer(
-            "Чек создан в Crypto Pay, но запись в базе не сохранилась. Обратитесь в поддержку.\n"
-            f'<a href="{html.escape(url, quote=True)}">Открыть чек</a>',
+        await user_shell_answer_or_edit(
+            message,
+            text=(
+                "Чек создан в Crypto Pay, но запись в базе не сохранилась. Обратитесь в поддержку.\n"
+                f'<a href="{html.escape(url, quote=True)}">Открыть чек</a>'
+            ),
             parse_mode="HTML",
+            reply_markup=kb_referrals_withdraw_cancel(),
         )
         await state.clear()
         return
@@ -3430,15 +3685,21 @@ async def process_referral_withdraw_amount(message: Message, state: FSMContext):
     )
     ref_img = referrals_photo_for_new_message()
     if ref_img:
-        await message.answer_photo(
-            photo=ref_img,
+        await user_shell_apply_photo(
+            message.bot,
+            uid,
+            chat_id,
+            None,
+            cache_key="shell_referrals",
+            photo_source=ref_img,
             caption=done_caption,
             parse_mode="HTML",
             reply_markup=kb_referrals_screen(),
         )
     else:
-        await message.answer(
-            done_caption,
+        await user_shell_answer_or_edit(
+            message,
+            text=done_caption,
             parse_mode="HTML",
             reply_markup=kb_referrals_screen(),
         )
@@ -3455,31 +3716,40 @@ async def process_team_name(message: Message, state: FSMContext):
         return
     raw = (message.text or "").strip()
     if len(raw) < 2:
-        await message.answer(
-            "Название слишком короткое. Введите минимум 2 символа.",
+        await user_shell_answer_or_edit(
+            message,
+            text="Название слишком короткое. Введите минимум 2 символа.",
+            parse_mode=None,
             reply_markup=kb_team_setup_cancel(),
         )
         return
     if team_get_by_owner(uid):
         await state.set_state(UserTeamStates.seats_count)
-        await message.answer(
-            "Команда уже создана. Введите количество участников (целое число от 1 до 100).",
+        await user_shell_answer_or_edit(
+            message,
+            text="Команда уже создана. Введите количество участников (целое число от 1 до 100).",
+            parse_mode=None,
             reply_markup=kb_team_setup_cancel(),
         )
         return
     if not team_create_for_owner(uid, raw):
-        await message.answer(
-            "Не удалось сохранить команду. Проверьте, что в Supabase создана таблица teams (файл teams.sql).",
+        await user_shell_answer_or_edit(
+            message,
+            text="Не удалось сохранить команду. Проверьте, что в Supabase создана таблица teams (файл teams.sql).",
+            parse_mode=None,
             reply_markup=kb_team_setup_cancel(),
         )
         return
     await state.set_state(UserTeamStates.seats_count)
-    await message.answer(
-        "👥 <b>Создание команды</b>\n\n"
-        f"Команда: <b>{esc_html(raw)}</b>\n\n"
-        "Введите <b>количество участников</b> целым числом от <b>1</b> до <b>100</b>.\n"
-        f"Стоимость: <b>{TEAM_SEAT_PRICE_USD:g} USD</b> за каждого — одним счётом в Crypto Bot.\n\n"
-        "/cancel — прервать.",
+    await user_shell_answer_or_edit(
+        message,
+        text=(
+            "👥 <b>Создание команды</b>\n\n"
+            f"Команда: <b>{esc_html(raw)}</b>\n\n"
+            "Введите <b>количество участников</b> целым числом от <b>1</b> до <b>100</b>.\n"
+            f"Стоимость: <b>{TEAM_SEAT_PRICE_USD:g} USD</b> за каждого — одним счётом в Crypto Bot.\n\n"
+            "/cancel — прервать."
+        ),
         parse_mode="HTML",
         reply_markup=kb_team_setup_cancel(),
     )
@@ -3498,29 +3768,37 @@ async def process_team_seats(message: Message, state: FSMContext):
     try:
         n = int(raw)
     except ValueError:
-        await message.answer(
-            "Введите целое число от 1 до 100.",
+        await user_shell_answer_or_edit(
+            message,
+            text="Введите целое число от 1 до 100.",
+            parse_mode=None,
             reply_markup=kb_team_setup_cancel(),
         )
         return
     if n < 1 or n > 100:
-        await message.answer(
-            "Число должно быть от 1 до 100.",
+        await user_shell_answer_or_edit(
+            message,
+            text="Число должно быть от 1 до 100.",
+            parse_mode=None,
             reply_markup=kb_team_setup_cancel(),
         )
         return
     team = team_get_by_owner(uid)
     if not team:
         await state.clear()
-        await message.answer(
-            "Команда не найдена. Откройте раздел «Команда» в меню заново.",
+        await user_shell_answer_or_edit(
+            message,
+            text="Команда не найдена. Откройте раздел «Команда» в меню заново.",
+            parse_mode=None,
             reply_markup=kb_user_back_main(),
         )
         return
     if int(team.get("seats_purchased") or 0) > 0:
         await state.clear()
-        await message.answer(
-            "Места уже оплачены. Откройте «Команда» в меню.",
+        await user_shell_answer_or_edit(
+            message,
+            text="Места уже оплачены. Откройте «Команда» в меню.",
+            parse_mode=None,
             reply_markup=kb_user_back_main(),
         )
         return
@@ -3540,8 +3818,9 @@ async def process_team_seats(message: Message, state: FSMContext):
     )
     await state.clear()
     if err:
-        await message.answer(
-            f"⚠️ {esc_html(err)}\n\nОткройте «Команда» и введите количество снова.",
+        await user_shell_answer_or_edit(
+            message,
+            text=f"⚠️ {esc_html(err)}\n\nОткройте «Команда» и введите количество снова.",
             parse_mode="HTML",
             reply_markup=kb_user_back_main(),
         )
@@ -3551,12 +3830,15 @@ async def process_team_seats(message: Message, state: FSMContext):
         if CRYPTO_PAY_TESTNET
         else "Оплата через <b>@CryptoBot</b>."
     )
-    await message.answer(
-        "<b>Счёт в Crypto Bot</b>\n\n"
-        f"Мест: <b>{n}</b> × <b>{TEAM_SEAT_PRICE_USD:g} USD</b> ≈ <b>{total_usd:g} USD</b> "
-        f"(сумма в счёте: <b>{esc_html(amount)} {esc_html(CRYPTO_PAY_ASSET)}</b>).\n"
-        f"{net_hint}\n\n"
-        "<b>Выберите вариант оплаты:</b>",
+    await user_shell_answer_or_edit(
+        message,
+        text=(
+            "<b>Счёт в Crypto Bot</b>\n\n"
+            f"Мест: <b>{n}</b> × <b>{TEAM_SEAT_PRICE_USD:g} USD</b> ≈ <b>{total_usd:g} USD</b> "
+            f"(сумма в счёте: <b>{esc_html(amount)} {esc_html(CRYPTO_PAY_ASSET)}</b>).\n"
+            f"{net_hint}\n\n"
+            "<b>Выберите вариант оплаты:</b>"
+        ),
         parse_mode="HTML",
         reply_markup=kb_team_after_invoice(pay_url or ""),
     )
@@ -3575,22 +3857,28 @@ async def process_team_add_seats_count(message: Message, state: FSMContext):
     try:
         n = int(raw)
     except ValueError:
-        await message.answer(
-            "Введите целое число от 1 до 100.",
+        await user_shell_answer_or_edit(
+            message,
+            text="Введите целое число от 1 до 100.",
+            parse_mode=None,
             reply_markup=kb_team_setup_cancel(),
         )
         return
     if n < 1 or n > 100:
-        await message.answer(
-            "Число должно быть от 1 до 100.",
+        await user_shell_answer_or_edit(
+            message,
+            text="Число должно быть от 1 до 100.",
+            parse_mode=None,
             reply_markup=kb_team_setup_cancel(),
         )
         return
     team = team_get_by_owner(uid)
     if not team or int(team.get("seats_purchased") or 0) < 1:
         await state.clear()
-        await message.answer(
-            "Команда не найдена или нет оплаченных мест. Откройте «Команда» в меню.",
+        await user_shell_answer_or_edit(
+            message,
+            text="Команда не найдена или нет оплаченных мест. Откройте «Команда» в меню.",
+            parse_mode=None,
             reply_markup=kb_user_back_main(),
         )
         return
@@ -3610,8 +3898,9 @@ async def process_team_add_seats_count(message: Message, state: FSMContext):
     )
     await state.clear()
     if err:
-        await message.answer(
-            f"⚠️ {esc_html(err)}\n\nПовторите ввод или откройте «Команда».",
+        await user_shell_answer_or_edit(
+            message,
+            text=f"⚠️ {esc_html(err)}\n\nПовторите ввод или откройте «Команда».",
             parse_mode="HTML",
             reply_markup=kb_user_back_main(),
         )
@@ -3621,12 +3910,15 @@ async def process_team_add_seats_count(message: Message, state: FSMContext):
         if CRYPTO_PAY_TESTNET
         else "Оплата через <b>@CryptoBot</b>."
     )
-    await message.answer(
-        "<b>Счёт в Crypto Bot</b> (доп. места)\n\n"
-        f"Мест: <b>{n}</b> × <b>{TEAM_SEAT_PRICE_USD:g} USD</b> ≈ <b>{total_usd:g} USD</b> "
-        f"(сумма в счёте: <b>{esc_html(amount)} {esc_html(CRYPTO_PAY_ASSET)}</b>).\n"
-        f"{net_hint}\n\n"
-        "<b>Выберите вариант оплаты:</b>",
+    await user_shell_answer_or_edit(
+        message,
+        text=(
+            "<b>Счёт в Crypto Bot</b> (доп. места)\n\n"
+            f"Мест: <b>{n}</b> × <b>{TEAM_SEAT_PRICE_USD:g} USD</b> ≈ <b>{total_usd:g} USD</b> "
+            f"(сумма в счёте: <b>{esc_html(amount)} {esc_html(CRYPTO_PAY_ASSET)}</b>).\n"
+            f"{net_hint}\n\n"
+            "<b>Выберите вариант оплаты:</b>"
+        ),
         parse_mode="HTML",
         reply_markup=kb_team_after_invoice(pay_url or ""),
     )
@@ -3644,8 +3936,10 @@ async def process_team_add_member_id(message: Message, state: FSMContext):
     team = team_get_by_owner(uid)
     if not team or int(team.get("seats_purchased") or 0) < 1:
         await state.clear()
-        await message.answer(
-            "Команда не найдена. Откройте «Команда» в меню.",
+        await user_shell_answer_or_edit(
+            message,
+            text="Команда не найдена. Откройте «Команда» в меню.",
+            parse_mode=None,
             reply_markup=kb_user_back_main(),
         )
         return
@@ -3654,8 +3948,10 @@ async def process_team_add_member_id(message: Message, state: FSMContext):
     raw = (message.text or "").strip()
     tokens = [x for x in re.split(r"[\s,;]+", raw) if x.strip()]
     if not tokens:
-        await message.answer(
-            "Введите один или несколько числовых Telegram ID.",
+        await user_shell_answer_or_edit(
+            message,
+            text="Введите один или несколько числовых Telegram ID.",
+            parse_mode=None,
             reply_markup=kb_team_setup_cancel(),
         )
         return
@@ -3683,7 +3979,12 @@ async def process_team_add_member_id(message: Message, state: FSMContext):
             break
         elif code == "not_owner":
             await state.clear()
-            await message.answer("Ошибка доступа.", reply_markup=kb_user_back_main())
+            await user_shell_answer_or_edit(
+                message,
+                text="Ошибка доступа.",
+                parse_mode=None,
+                reply_markup=kb_user_back_main(),
+            )
             return
         else:
             errs.append(
@@ -3699,8 +4000,9 @@ async def process_team_add_member_id(message: Message, state: FSMContext):
         f"\nСвободных слотов: <b>{free_now}</b> из <b>{seats}</b>.\n"
         "Отправьте ещё ID или откройте «Команда» для списка."
     )
-    await message.answer(
-        "\n\n".join(parts),
+    await user_shell_answer_or_edit(
+        message,
+        text="\n\n".join(parts),
         parse_mode="HTML",
         reply_markup=kb_team_setup_cancel() if free_now > 0 else kb_team_dashboard(),
     )
@@ -3752,22 +4054,12 @@ async def cmd_cancel(message: Message, state: FSMContext):
     current = await state.get_state()
     if current == UserReferralWithdrawStates.amount:
         await state.clear()
-        text = await build_referrals_user_html(message.from_user.id)
-        cancel_caption = "<i>Отменено.</i>\n\n" + text
-        ref_img = referrals_photo_for_new_message()
-        if ref_img:
-            await message.answer_photo(
-                photo=ref_img,
-                caption=cancel_caption,
-                parse_mode="HTML",
-                reply_markup=kb_referrals_screen(),
-            )
-        else:
-            await message.answer(
-                cancel_caption,
-                parse_mode="HTML",
-                reply_markup=kb_referrals_screen(),
-            )
+        await user_shell_refresh_referrals(
+            message.bot,
+            message.from_user.id,
+            message.chat.id,
+            prefix_html="<i>Отменено.</i>",
+        )
         return
     if current in (
         UserTeamStates.name,
@@ -3776,9 +4068,13 @@ async def cmd_cancel(message: Message, state: FSMContext):
         UserTeamStates.add_member_id,
     ):
         await state.clear()
-        await message.answer(
-            "Действие с командой отменено.",
-            reply_markup=kb_user_back_main(),
+        await show_user_main_menu(
+            message.bot,
+            message.chat.id,
+            extra_caption="Действие с командой отменено.",
+            telegram_user_id=message.from_user.id,
+            telegram_username=message.from_user.username if message.from_user else None,
+            anchor_message=None,
         )
         return
     if not is_admin(message.from_user.id):
