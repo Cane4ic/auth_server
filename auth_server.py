@@ -57,6 +57,11 @@ except ImportError:
     HAS_PIL = False
 
 try:
+    import imageio_ffmpeg
+except ImportError:
+    imageio_ffmpeg = None  # type: ignore
+
+try:
     from postgrest.exceptions import APIError as PostgrestAPIError
 except ImportError:  # pragma: no cover
 
@@ -142,6 +147,8 @@ SUBSCRIPTION_REMINDER_INTERVAL_SEC = int(
 )
 UNIQUEIZER_MAX_COPIES = max(1, min(50, int((os.environ.get("UNIQUEIZER_MAX_COPIES") or "25").strip() or "25")))
 UNIQUEIZER_MAX_FILE_MB = max(1, min(50, int((os.environ.get("UNIQUEIZER_MAX_FILE_MB") or "20").strip() or "20")))
+# Уникализатор: полный путь к ffmpeg; пусто — поиск в PATH (видео и усиленная обработка фото).
+FFMPEG_PATH = (os.environ.get("FFMPEG_PATH") or "").strip()
 
 # Файлы выдачи после успешной оплаты подписки
 APP_ZIP_PATH = (os.environ.get("APP_ZIP_PATH") or "app.zip").strip()
@@ -932,8 +939,92 @@ def kb_uniqueizer_copies_pick() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _ffmpeg_available() -> bool:
-    return shutil.which("ffmpeg") is not None
+def _ffmpeg_bin() -> Optional[str]:
+    """Порядок: FFMPEG_PATH → ffmpeg в PATH → бинарник из пакета imageio-ffmpeg (pip)."""
+    if FFMPEG_PATH:
+        p = FFMPEG_PATH
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+        if os.path.isfile(p):
+            return p
+    w = shutil.which("ffmpeg")
+    if w:
+        return w
+    if imageio_ffmpeg is not None:
+        try:
+            bundled = imageio_ffmpeg.get_ffmpeg_exe()
+            if bundled and os.path.isfile(bundled):
+                return bundled
+        except Exception as e:
+            print(f"imageio_ffmpeg.get_ffmpeg_exe: {e}")
+    return None
+
+
+def _ffmpeg_vf_for_uniqueize_image(opts: set[str], variant: int, rng: random.Random) -> str:
+    """Цепочка фильтров libavfilter для одного кадра (фото)."""
+    use = opts if opts else {"jpeg_q", "brightness"}
+    parts: list[str] = []
+    if "flip_h" in use and (variant % 2) == 0:
+        parts.append("hflip")
+    if "flip_v" in use and (variant % 2) == 1:
+        parts.append("vflip")
+    br, ctr, sat = 0.0, 1.0, 1.0
+    if "brightness" in use:
+        br += rng.uniform(-0.14, 0.14) + (variant % 7 - 3) * 0.018
+    if "contrast" in use:
+        ctr += rng.uniform(-0.18, 0.22) + (variant % 5) * 0.012
+    if "saturation" in use:
+        sat += rng.uniform(-0.32, 0.35) + (variant % 4) * 0.025
+    if abs(br) > 1e-6 or abs(ctr - 1.0) > 1e-6 or abs(sat - 1.0) > 1e-6:
+        parts.append(f"eq=brightness={br:.5f}:contrast={ctr:.5f}:saturation={sat:.5f}")
+    if "saturation" in use:
+        hue = ((variant * 23) % 90 - 45) + rng.uniform(-8.0, 8.0)
+        parts.append(f"hue=h={hue}*PI/180")
+    if "sharpen" in use:
+        parts.append(
+            f"unsharp=5:5:{0.45 + variant * 0.04:.2f}:5:5:{0.15 + (variant % 4) * 0.12:.2f}"
+        )
+    if "noise" in use:
+        n = 12 + (variant % 18) * 3
+        parts.append(f"noise=alls={n}:allf=t+u")
+    if "resize_pct" in use:
+        sc = 100 + (variant % 11 - 5)
+        parts.append(f"scale=iw*{sc}/100:-2:flags=lanczos")
+    if "rot_small" in use:
+        parts.append(f"gblur=sigma={0.12 + (variant % 6) * 0.07 + rng.random() * 0.12:.3f}")
+        vang = 0.45 + (variant % 7) * 0.09
+        parts.append(f"vignette={vang:.4f}")
+    if not parts:
+        parts.append(
+            f"eq=brightness={(variant % 5 - 2) * 0.025:.5f}:contrast={1.02 + (variant % 5) * 0.015:.5f}"
+        )
+    return ",".join(parts)
+
+
+def _ffmpeg_run_image(
+    ffmpeg_exe: str,
+    in_path: str,
+    out_jpg: str,
+    vf: str,
+    qv: int,
+) -> None:
+    cmd = [
+        ffmpeg_exe,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        in_path,
+        "-vf",
+        vf,
+        "-frames:v",
+        "1",
+        "-q:v",
+        str(max(2, min(31, int(qv)))),
+        out_jpg,
+    ]
+    subprocess.run(cmd, check=True, capture_output=True, timeout=120)
 
 
 def _apply_uniqueizer_pil(im: Image.Image, options: list[str], variant: int) -> Image.Image:
@@ -998,18 +1089,23 @@ def _uniqueizer_process_to_zip(
     copies = max(1, min(UNIQUEIZER_MAX_COPIES, int(copies)))
     work = tempfile.mkdtemp(prefix="uz_")
     try:
+        ffmpeg_exe = _ffmpeg_bin()
+        if not is_video and not ffmpeg_exe and not HAS_PIL:
+            shutil.rmtree(work, ignore_errors=True)
+            return None, "Для фото нужен ffmpeg (рекомендуется) или Pillow на сервере."
+
         zip_path = os.path.join(work, "unique_pack.zip")
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             ext = os.path.splitext(media_path)[1].lower() or (".mp4" if is_video else ".jpg")
             for i in range(copies):
                 if is_video:
-                    if _ffmpeg_available():
+                    if ffmpeg_exe:
                         out_v = os.path.join(work, f"u_{i+1:03d}{ext}")
                         hue = ((i * 17) % 50) - 25
                         sat = 0.9 + (i % 5) * 0.04
                         vf = f"hue=h={hue}*PI/180:s={sat}"
                         cmd = [
-                            "ffmpeg",
+                            ffmpeg_exe,
                             "-hide_banner",
                             "-loglevel",
                             "error",
@@ -1033,20 +1129,40 @@ def _uniqueizer_process_to_zip(
                             return None, f"Не удалось обработать видео (ffmpeg): {e}"
                         zf.write(out_v, arcname=f"unique_{i+1:03d}{ext}")
                     else:
-                        # Нет ffmpeg — копии с разным «шумом» в имени + один и тот же файл (ограничение)
                         arc = f"unique_{i+1:03d}{ext}"
                         zf.write(media_path, arcname=arc)
                 else:
-                    if not HAS_PIL:
-                        return None, "На сервере не установлен Pillow — обработка фото недоступна."
-                    try:
-                        im = Image.open(media_path)
-                        out_img = _apply_uniqueizer_pil(im, options, i)
-                        out_p = os.path.join(work, f"u_{i+1:03d}.jpg")
-                        out_img.save(out_p, format="JPEG", quality=88, optimize=True)
-                        zf.write(out_p, arcname=f"unique_{i+1:03d}.jpg")
-                    except Exception as e:
-                        return None, f"Ошибка обработки изображения: {e}"
+                    out_p = os.path.join(work, f"u_{i+1:03d}.jpg")
+                    opts_set = set(options) if options else set()
+                    ok_ffmpeg = False
+                    if ffmpeg_exe:
+                        rng = random.Random(
+                            i * 13001 + (hash(tuple(sorted(options))) % 999983)
+                        )
+                        vf = _ffmpeg_vf_for_uniqueize_image(opts_set, i, rng)
+                        if "jpeg_q" in opts_set:
+                            qv = 3 + (i * 4) % 14
+                        else:
+                            qv = 3 + (i * 2) % 6
+                        try:
+                            _ffmpeg_run_image(ffmpeg_exe, media_path, out_p, vf, qv)
+                            ok_ffmpeg = os.path.isfile(out_p) and os.path.getsize(out_p) > 0
+                        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+                            ok_ffmpeg = False
+                    if not ok_ffmpeg:
+                        if not HAS_PIL:
+                            return None, (
+                                "ffmpeg не смог обработать фото, а Pillow не установлен."
+                                if ffmpeg_exe
+                                else "Нет ffmpeg и Pillow — обработка фото недоступна."
+                            )
+                        try:
+                            im = Image.open(media_path)
+                            out_img = _apply_uniqueizer_pil(im, options, i)
+                            out_img.save(out_p, format="JPEG", quality=88, optimize=True)
+                        except Exception as e:
+                            return None, f"Ошибка обработки изображения: {e}"
+                    zf.write(out_p, arcname=f"unique_{i+1:03d}.jpg")
         final_zip = work + ".zip"
         shutil.move(zip_path, final_zip)
         shutil.rmtree(work, ignore_errors=True)
@@ -2322,7 +2438,9 @@ def text_uniqueizer_screen_html() -> str:
         "• <b>Уникализация</b> — загрузите фото или видео, выберите шаблон (если ещё не выбран), "
         "задайте число копий; бот вернёт ZIP с вариантами.\n"
         "• <b>Шаблоны</b> — набор опций обработки; один шаблон отмечен ✓ и используется при уникализации.\n\n"
-        "<i>Видео без ffmpeg на сервере: в архив попадут копии одного файла (рекомендуется установить ffmpeg).</i>"
+        "<i><b>ffmpeg</b> подключается автоматически через пакет <code>imageio-ffmpeg</code> (уже в зависимостях). "
+        "При желании можно указать свой бинарник: <code>FFMPEG_PATH</code> или системный ffmpeg в PATH. "
+        "Если ffmpeg недоступен: видео в ZIP — дубликаты одного файла; фото — через Pillow.</i>"
     )
 
 
