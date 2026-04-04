@@ -1027,6 +1027,89 @@ def _ffmpeg_run_image(
     subprocess.run(cmd, check=True, capture_output=True, timeout=120)
 
 
+def _ffmpeg_transcode_video_copy(
+    ffmpeg_exe: str,
+    media_path: str,
+    out_path: str,
+    variant_index: int,
+) -> tuple[bool, str]:
+    """
+    Перекодирование одной копии видео (фильтр hue). Сначала libx264, иначе mpeg4 —
+    урезанные сборки ffmpeg часто без x264.
+    Возвращает (успех, текст_ошибки).
+    """
+    hue = ((variant_index * 17) % 50) - 25
+    sat = 0.9 + (variant_index % 5) * 0.04
+    vf = f"hue=h={hue}*PI/180:s={sat}"
+    attempts: list[list[str]] = [
+        [
+            ffmpeg_exe,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            media_path,
+            "-vf",
+            vf,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            str(20 + (variant_index % 6)),
+            "-pix_fmt",
+            "yuv420p",
+            "-an",
+            "-movflags",
+            "+faststart",
+            out_path,
+        ],
+        [
+            ffmpeg_exe,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            media_path,
+            "-vf",
+            vf,
+            "-c:v",
+            "mpeg4",
+            "-q:v",
+            str(3 + (variant_index % 8)),
+            "-an",
+            out_path,
+        ],
+    ]
+    last_err = ""
+    for cmd in attempts:
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=300)
+            err_txt = (r.stderr or b"").decode(errors="replace").strip()
+            if (
+                r.returncode == 0
+                and os.path.isfile(out_path)
+                and os.path.getsize(out_path) > 0
+            ):
+                return True, ""
+            last_err = err_txt or f"код выхода {r.returncode}"
+            if os.path.isfile(out_path):
+                try:
+                    os.remove(out_path)
+                except OSError:
+                    pass
+        except subprocess.TimeoutExpired:
+            last_err = "превышено время обработки (5 мин)"
+        except Exception as e:
+            last_msg = str(e)
+            last_err = last_msg
+    if last_err:
+        print(f"uniqueizer ffmpeg video: {last_err[:2000]}")
+    return False, (last_err or "неизвестная ошибка ffmpeg")[:900]
+
+
 def _apply_uniqueizer_pil(im: Image.Image, options: list[str], variant: int) -> Image.Image:
     rng = random.Random(variant * 13001 + (hash(tuple(sorted(options))) % 999983))
     img = im.convert("RGB")
@@ -1101,34 +1184,22 @@ def _uniqueizer_process_to_zip(
                 if is_video:
                     if ffmpeg_exe:
                         out_v = os.path.join(work, f"u_{i+1:03d}{ext}")
-                        hue = ((i * 17) % 50) - 25
-                        sat = 0.9 + (i % 5) * 0.04
-                        vf = f"hue=h={hue}*PI/180:s={sat}"
-                        cmd = [
-                            ffmpeg_exe,
-                            "-hide_banner",
-                            "-loglevel",
-                            "error",
-                            "-y",
-                            "-i",
-                            media_path,
-                            "-vf",
-                            vf,
-                            "-c:v",
-                            "libx264",
-                            "-preset",
-                            "veryfast",
-                            "-crf",
-                            str(20 + (i % 6)),
-                            "-an",
-                            out_v,
-                        ]
-                        try:
-                            subprocess.run(cmd, check=True, capture_output=True, timeout=300)
-                        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-                            return None, f"Не удалось обработать видео (ffmpeg): {e}"
+                        ok_v, err_v = _ffmpeg_transcode_video_copy(
+                            ffmpeg_exe, media_path, out_v, i
+                        )
+                        if not ok_v:
+                            return None, (
+                                "Видео: ffmpeg не смог перекодировать. "
+                                "Проверьте, что в окружении есть рабочий ffmpeg "
+                                "(pip: imageio-ffmpeg) или см. лог сервера. "
+                                f"Детали: {err_v}"
+                            )
                         zf.write(out_v, arcname=f"unique_{i+1:03d}{ext}")
                     else:
+                        print(
+                            "uniqueizer: видео без ffmpeg — в ZIP попадают дубликаты одного файла "
+                            "(установите imageio-ffmpeg или FFMPEG_PATH / ffmpeg в PATH)"
+                        )
                         arc = f"unique_{i+1:03d}{ext}"
                         zf.write(media_path, arcname=arc)
                 else:
@@ -4077,7 +4148,7 @@ async def uniqueizer_tpl_name_message(message: Message, state: FSMContext):
     )
 
 
-@dp.message(UniqueizerStates.uniq_media, F.photo | F.video | F.document)
+@dp.message(UniqueizerStates.uniq_media, F.photo | F.video | F.video_note | F.document)
 async def uniqueizer_receive_media(message: Message, state: FSMContext):
     if not user_has_active_uniqueizer_plan(message.from_user.id):
         await state.clear()
@@ -4100,6 +4171,11 @@ async def uniqueizer_receive_media(message: Message, state: FSMContext):
         suffix = ".mp4"
         is_video = True
         size_b = getattr(message.video, "file_size", None)
+    elif message.video_note:
+        file_id = message.video_note.file_id
+        suffix = ".mp4"
+        is_video = True
+        size_b = getattr(message.video_note, "file_size", None)
     elif message.document:
         doc = message.document
         mt = (doc.mime_type or "").lower()
