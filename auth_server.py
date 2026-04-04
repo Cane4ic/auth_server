@@ -1027,6 +1027,15 @@ def _ffmpeg_run_image(
     subprocess.run(cmd, check=True, capture_output=True, timeout=120)
 
 
+_UNIQUEIZER_VIDEO_EXTS = frozenset(
+    {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".3gp", ".3g2"}
+)
+
+
+def _uniqueizer_path_looks_like_video(media_path: str) -> bool:
+    return os.path.splitext(media_path)[1].lower() in _UNIQUEIZER_VIDEO_EXTS
+
+
 def _ffmpeg_transcode_video_copy(
     ffmpeg_exe: str,
     media_path: str,
@@ -1172,36 +1181,42 @@ def _uniqueizer_process_to_zip(
     copies = max(1, min(UNIQUEIZER_MAX_COPIES, int(copies)))
     work = tempfile.mkdtemp(prefix="uz_")
     try:
+        if _uniqueizer_path_looks_like_video(media_path):
+            is_video = True
         ffmpeg_exe = _ffmpeg_bin()
+        io_ffmpeg_ok = imageio_ffmpeg is not None
+        print(
+            f"uniqueizer: is_video={is_video} ffmpeg_bin={ffmpeg_exe!r} "
+            f"imageio_ffmpeg_imported={io_ffmpeg_ok} file={os.path.basename(media_path)!r}"
+        )
         if not is_video and not ffmpeg_exe and not HAS_PIL:
             shutil.rmtree(work, ignore_errors=True)
             return None, "Для фото нужен ffmpeg (рекомендуется) или Pillow на сервере."
+        if is_video and not ffmpeg_exe:
+            shutil.rmtree(work, ignore_errors=True)
+            return None, (
+                "Видео не обработано: не найден ffmpeg.\n\n"
+                "На сервере с ботом выполните: pip install -r requirements.txt "
+                "(нужен пакет imageio-ffmpeg) или задайте FFMPEG_PATH / ffmpeg в PATH."
+            )
 
         zip_path = os.path.join(work, "unique_pack.zip")
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             ext = os.path.splitext(media_path)[1].lower() or (".mp4" if is_video else ".jpg")
             for i in range(copies):
                 if is_video:
-                    if ffmpeg_exe:
-                        out_v = os.path.join(work, f"u_{i+1:03d}{ext}")
-                        ok_v, err_v = _ffmpeg_transcode_video_copy(
-                            ffmpeg_exe, media_path, out_v, i
+                    out_v = os.path.join(work, f"u_{i+1:03d}{ext}")
+                    ok_v, err_v = _ffmpeg_transcode_video_copy(
+                        ffmpeg_exe, media_path, out_v, i
+                    )
+                    if not ok_v:
+                        return None, (
+                            "Видео: ffmpeg не смог перекодировать. "
+                            "Проверьте, что в окружении есть рабочий ffmpeg "
+                            "(pip: imageio-ffmpeg) или см. лог сервера. "
+                            f"Детали: {err_v}"
                         )
-                        if not ok_v:
-                            return None, (
-                                "Видео: ffmpeg не смог перекодировать. "
-                                "Проверьте, что в окружении есть рабочий ffmpeg "
-                                "(pip: imageio-ffmpeg) или см. лог сервера. "
-                                f"Детали: {err_v}"
-                            )
-                        zf.write(out_v, arcname=f"unique_{i+1:03d}{ext}")
-                    else:
-                        print(
-                            "uniqueizer: видео без ffmpeg — в ZIP попадают дубликаты одного файла "
-                            "(установите imageio-ffmpeg или FFMPEG_PATH / ffmpeg в PATH)"
-                        )
-                        arc = f"unique_{i+1:03d}{ext}"
-                        zf.write(media_path, arcname=arc)
+                    zf.write(out_v, arcname=f"unique_{i+1:03d}{ext}")
                 else:
                     out_p = os.path.join(work, f"u_{i+1:03d}.jpg")
                     opts_set = set(options) if options else set()
