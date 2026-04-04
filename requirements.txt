@@ -4,3 +4,4 @@ aiogram
 supabase
 pydantic
 requests
+Pillow
