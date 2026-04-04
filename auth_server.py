@@ -4,11 +4,17 @@ API для приложения + админ-панель в Telegram (ADMIN_ID 
 """
 import asyncio
 import html
+import io
 import json
 import os
+import random
 import re
+import shutil
+import subprocess
+import tempfile
 import time
 import uuid
+import zipfile
 from collections import defaultdict
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -42,6 +48,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 from supabase import Client, create_client
+
+try:
+    from PIL import Image, ImageEnhance, ImageOps
+
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
 
 try:
     from postgrest.exceptions import APIError as PostgrestAPIError
@@ -127,6 +140,8 @@ SUBSCRIPTION_REMINDER_DAYS = (7, 3, 1)
 SUBSCRIPTION_REMINDER_INTERVAL_SEC = int(
     (os.environ.get("SUBSCRIPTION_REMINDER_INTERVAL_SEC") or "3600").strip() or "3600"
 )
+UNIQUEIZER_MAX_COPIES = max(1, min(50, int((os.environ.get("UNIQUEIZER_MAX_COPIES") or "25").strip() or "25")))
+UNIQUEIZER_MAX_FILE_MB = max(1, min(50, int((os.environ.get("UNIQUEIZER_MAX_FILE_MB") or "20").strip() or "20")))
 
 # Файлы выдачи после успешной оплаты подписки
 APP_ZIP_PATH = (os.environ.get("APP_ZIP_PATH") or "app.zip").strip()
@@ -251,6 +266,15 @@ class UserTeamStates(StatesGroup):
     seats_count = State()
     add_seats_count = State()
     add_member_id = State()
+
+
+class UniqueizerStates(StatesGroup):
+    """Уникализатор: шаблон (имя → настройки) и сценарий медиа → копии."""
+    tpl_name = State()
+    tpl_build = State()
+    uniq_media = State()
+    uniq_wait_tpl = State()
+    uniq_copies = State()
 
 
 def is_admin(user_id: int) -> bool:
@@ -710,6 +734,339 @@ def user_has_active_uniqueizer_plan(telegram_id: int) -> bool:
     if (u.get("subscription_plan") or "").strip().lower() == "u":
         return int(u.get("subscription_until") or 0) >= now
     return False
+
+
+# --- Уникализатор: шаблоны и обработка медиа ---------------------------------
+
+UNIQUEIZER_OPTION_DEFS: tuple[tuple[str, str], ...] = (
+    ("flip_h", "Отразить горизонтально"),
+    ("flip_v", "Отразить вертикально"),
+    ("rot_small", "Лёгкий поворот"),
+    ("brightness", "Яркость"),
+    ("contrast", "Контраст"),
+    ("saturation", "Насыщенность"),
+    ("sharpen", "Резкость"),
+    ("resize_pct", "Масштаб ±%"),
+    ("noise", "Лёгкий шум"),
+    ("jpeg_q", "JPEG-качество"),
+)
+UNIQUEIZER_OPTION_KEYS = frozenset(k for k, _ in UNIQUEIZER_OPTION_DEFS)
+UNIQUEIZER_OPT_LABEL = dict(UNIQUEIZER_OPTION_DEFS)
+
+
+def _user_uniqueizer_selected_template_id(u: Optional[dict]) -> Optional[str]:
+    if not u:
+        return None
+    raw = u.get("uniqueizer_selected_template_id")
+    if raw is None or raw == "":
+        return None
+    return str(raw).strip()
+
+
+def user_set_uniqueizer_selected_template(telegram_id: int, template_id: Optional[str]) -> None:
+    patch: dict = {"uniqueizer_selected_template_id": template_id}
+    if template_id is None:
+        patch["uniqueizer_selected_template_id"] = None
+    try:
+        u = user_get(telegram_id)
+        if u:
+            supabase.table("users").update(patch).eq("telegram_id", telegram_id).execute()
+        else:
+            supabase.table("users").insert(
+                {"telegram_id": telegram_id, "subscription_until": 0, "hwid": None, **patch}
+            ).execute()
+    except Exception as e:
+        print(f"user_set_uniqueizer_selected_template {telegram_id}: {e}")
+
+
+def uniqueizer_templates_list(telegram_id: int) -> list[dict]:
+    try:
+        r = (
+            supabase.table("uniqueizer_templates")
+            .select("*")
+            .eq("telegram_id", telegram_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
+        return list(r.data or [])
+    except Exception as e:
+        print(f"uniqueizer_templates_list {telegram_id}: {e}")
+        return []
+
+
+def uniqueizer_template_get_row(template_id: str) -> Optional[dict]:
+    try:
+        r = (
+            supabase.table("uniqueizer_templates")
+            .select("*")
+            .eq("id", str(template_id).strip())
+            .limit(1)
+            .execute()
+        )
+        return r.data[0] if r.data else None
+    except Exception as e:
+        print(f"uniqueizer_template_get_row {template_id}: {e}")
+        return None
+
+
+def uniqueizer_template_insert_row(telegram_id: int, name: str, options: list[str]) -> Optional[str]:
+    nm = (name or "").strip()[:120] or "Шаблон"
+    opts = [x for x in options if x in UNIQUEIZER_OPTION_KEYS]
+    now = int(time.time())
+    try:
+        r = (
+            supabase.table("uniqueizer_templates")
+            .insert(
+                {
+                    "telegram_id": telegram_id,
+                    "name": nm,
+                    "options": opts,
+                    "created_at": now,
+                }
+            )
+            .execute()
+        )
+        if r.data:
+            return str(r.data[0].get("id") or "")
+    except Exception as e:
+        print(f"uniqueizer_template_insert_row: {e}")
+    return None
+
+
+def _template_options_from_row(row: dict) -> list[str]:
+    raw = row.get("options")
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [str(x) for x in raw if str(x) in UNIQUEIZER_OPTION_KEYS]
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return [str(x) for x in parsed if str(x) in UNIQUEIZER_OPTION_KEYS]
+        except json.JSONDecodeError:
+            pass
+    return []
+
+
+def kb_uniqueizer_hub() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📦 Уникализация", callback_data=f"{UCB}:uzrun")],
+            [InlineKeyboardButton(text="📋 Шаблоны", callback_data=f"{UCB}:uztpl")],
+            [InlineKeyboardButton(text="⬅️ Главное меню", callback_data=f"{UCB}:main")],
+        ]
+    )
+
+
+def kb_uniqueizer_cancel_hub() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data=f"{UCB}:uzhm")],
+        ]
+    )
+
+
+def kb_uniqueizer_tpl_empty() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Создать шаблон", callback_data=f"{UCB}:uznew")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{UCB}:uzhm")],
+        ]
+    )
+
+
+def kb_uniqueizer_tpl_list(uid: int, rows: list[dict], selected_id: Optional[str]) -> InlineKeyboardMarkup:
+    lines: list[list[InlineKeyboardButton]] = []
+    for row in rows:
+        tid = str(row.get("id") or "")
+        if not tid:
+            continue
+        mark = "✓ " if selected_id == tid else ""
+        nm = (row.get("name") or "Шаблон")[:28]
+        lines.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{mark}{nm}",
+                    callback_data=f"{UCB}:uzsel:{tid}",
+                )
+            ]
+        )
+    lines.append([InlineKeyboardButton(text="➕ Создать шаблон", callback_data=f"{UCB}:uznew")])
+    lines.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{UCB}:uzhm")])
+    return InlineKeyboardMarkup(inline_keyboard=lines)
+
+
+def kb_uniqueizer_tpl_build(selected: set[str]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    row_buf: list[InlineKeyboardButton] = []
+    for key, label in UNIQUEIZER_OPTION_DEFS:
+        check = "✓ " if key in selected else ""
+        row_buf.append(
+            InlineKeyboardButton(
+                text=f"{check}{label[:18]}",
+                callback_data=f"{UCB}:uztgl:{key}",
+            )
+        )
+        if len(row_buf) >= 2:
+            rows.append(row_buf)
+            row_buf = []
+    if row_buf:
+        rows.append(row_buf)
+    rows.append(
+        [InlineKeyboardButton(text="✅ Выбрать", callback_data=f"{UCB}:uzfin")],
+    )
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"{UCB}:uzhm")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_uniqueizer_copies_pick() -> InlineKeyboardMarkup:
+    presets = [1, 3, 5, 10, 15, 20]
+    row = [
+        InlineKeyboardButton(text=str(n), callback_data=f"{UCB}:uzcp:{n}")
+        for n in presets
+        if n <= UNIQUEIZER_MAX_COPIES
+    ]
+    rows = [row[i : i + 3] for i in range(0, len(row), 3)]
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"{UCB}:uzhm")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _ffmpeg_available() -> bool:
+    return shutil.which("ffmpeg") is not None
+
+
+def _apply_uniqueizer_pil(im: Image.Image, options: list[str], variant: int) -> Image.Image:
+    rng = random.Random(variant * 13001 + (hash(tuple(sorted(options))) % 999983))
+    img = im.convert("RGB")
+    opts = set(options) if options else {"jpeg_q", "brightness"}
+    if "flip_h" in opts and (variant % 3) != 0:
+        img = ImageOps.mirror(img)
+    if "flip_v" in opts and (variant % 3) == 1:
+        img = ImageOps.flip(img)
+    if "rot_small" in opts:
+        ang = rng.uniform(-2.1, 2.1) + (variant % 7) * 0.15
+        img = img.rotate(ang, resample=Image.BICUBIC, expand=False, fillcolor=(255, 255, 255))
+    if "brightness" in opts:
+        f = 1.0 + rng.uniform(-0.07, 0.07) + (variant % 5) * 0.003
+        img = ImageEnhance.Brightness(img).enhance(f)
+    if "contrast" in opts:
+        f = 1.0 + rng.uniform(-0.09, 0.09)
+        img = ImageEnhance.Contrast(img).enhance(f)
+    if "saturation" in opts:
+        f = 1.0 + rng.uniform(-0.14, 0.14)
+        img = ImageEnhance.Color(img).enhance(f)
+    if "sharpen" in opts:
+        f = 1.0 + rng.uniform(0.05, 0.35)
+        img = ImageEnhance.Sharpness(img).enhance(f)
+    if "resize_pct" in opts:
+        w, h = img.size
+        sc = 1.0 + (variant % 5 - 2) * 0.0045 + rng.uniform(-0.002, 0.002)
+        nw, nh = max(2, int(w * sc)), max(2, int(h * sc))
+        img = img.resize((nw, nh), Image.LANCZOS)
+        img = ImageOps.fit(img, (w, h), Image.LANCZOS)
+    if "noise" in opts:
+        px = img.load()
+        mw, mh = img.size
+        n_pix = max(80, mw * mh // 6000)
+        for _ in range(n_pix):
+            x, y = rng.randint(0, mw - 1), rng.randint(0, mh - 1)
+            r, g, b = px[x, y]
+            d = rng.randint(-5, 5)
+            px[x, y] = (
+                max(0, min(255, r + d)),
+                max(0, min(255, g + d)),
+                max(0, min(255, b + d)),
+            )
+    if "jpeg_q" in opts:
+        q = 68 + (variant * 5) % 24
+        bio = io.BytesIO()
+        img.save(bio, format="JPEG", quality=q, optimize=True)
+        bio.seek(0)
+        img = Image.open(bio).convert("RGB")
+    return img
+
+
+def _uniqueizer_process_to_zip(
+    media_path: str,
+    *,
+    is_video: bool,
+    options: list[str],
+    copies: int,
+) -> tuple[Optional[str], str]:
+    """Возвращает (путь к zip или None, сообщение об ошибке пользователю)."""
+    copies = max(1, min(UNIQUEIZER_MAX_COPIES, int(copies)))
+    work = tempfile.mkdtemp(prefix="uz_")
+    try:
+        zip_path = os.path.join(work, "unique_pack.zip")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            ext = os.path.splitext(media_path)[1].lower() or (".mp4" if is_video else ".jpg")
+            for i in range(copies):
+                if is_video:
+                    if _ffmpeg_available():
+                        out_v = os.path.join(work, f"u_{i+1:03d}{ext}")
+                        hue = ((i * 17) % 50) - 25
+                        sat = 0.9 + (i % 5) * 0.04
+                        vf = f"hue=h={hue}*PI/180:s={sat}"
+                        cmd = [
+                            "ffmpeg",
+                            "-hide_banner",
+                            "-loglevel",
+                            "error",
+                            "-y",
+                            "-i",
+                            media_path,
+                            "-vf",
+                            vf,
+                            "-c:v",
+                            "libx264",
+                            "-preset",
+                            "veryfast",
+                            "-crf",
+                            str(20 + (i % 6)),
+                            "-an",
+                            out_v,
+                        ]
+                        try:
+                            subprocess.run(cmd, check=True, capture_output=True, timeout=300)
+                        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                            return None, f"Не удалось обработать видео (ffmpeg): {e}"
+                        zf.write(out_v, arcname=f"unique_{i+1:03d}{ext}")
+                    else:
+                        # Нет ffmpeg — копии с разным «шумом» в имени + один и тот же файл (ограничение)
+                        arc = f"unique_{i+1:03d}{ext}"
+                        zf.write(media_path, arcname=arc)
+                else:
+                    if not HAS_PIL:
+                        return None, "На сервере не установлен Pillow — обработка фото недоступна."
+                    try:
+                        im = Image.open(media_path)
+                        out_img = _apply_uniqueizer_pil(im, options, i)
+                        out_p = os.path.join(work, f"u_{i+1:03d}.jpg")
+                        out_img.save(out_p, format="JPEG", quality=88, optimize=True)
+                        zf.write(out_p, arcname=f"unique_{i+1:03d}.jpg")
+                    except Exception as e:
+                        return None, f"Ошибка обработки изображения: {e}"
+        final_zip = work + ".zip"
+        shutil.move(zip_path, final_zip)
+        shutil.rmtree(work, ignore_errors=True)
+        return final_zip, ""
+    except Exception as e:
+        shutil.rmtree(work, ignore_errors=True)
+        return None, f"Сборка архива: {e}"
+
+
+async def _download_tg_file(bot: Bot, file_id: str, suffix: str) -> tuple[Optional[str], str]:
+    try:
+        tg_file = await bot.get_file(file_id)
+        if not tg_file.file_path:
+            return None, "Файл недоступен."
+        fd, path = tempfile.mkstemp(suffix=suffix)
+        os.close(fd)
+        await bot.download_file(tg_file.file_path, path)
+        return path, ""
+    except Exception as e:
+        return None, str(e)
 
 
 def team_get_by_owner(owner_telegram_id: int) -> Optional[dict]:
@@ -1960,7 +2317,13 @@ def text_uniqueizer_screen_html() -> str:
     raw = (os.environ.get("TEXT_UNIQUEIZER_SCREEN") or "").strip()
     if raw:
         return raw
-    return "🎯 <b>Уникализатор</b>\n\nРаздел в разработке."
+    return (
+        "🎯 <b>Уникализатор</b>\n\n"
+        "• <b>Уникализация</b> — загрузите фото или видео, выберите шаблон (если ещё не выбран), "
+        "задайте число копий; бот вернёт ZIP с вариантами.\n"
+        "• <b>Шаблоны</b> — набор опций обработки; один шаблон отмечен ✓ и используется при уникализации.\n\n"
+        "<i>Видео без ffmpeg на сервере: в архив попадут копии одного файла (рекомендуется установить ffmpeg).</i>"
+    )
 
 
 def kb_tariffs():
@@ -3323,9 +3686,379 @@ async def cb_user_uniqueizer_menu(query: CallbackQuery):
         query.message,
         text_uniqueizer_screen_html(),
         parse_mode="HTML",
-        reply_markup=kb_user_back_main(),
+        reply_markup=kb_uniqueizer_hub(),
     )
     await query.answer()
+
+
+async def _uniqueizer_guard(query: CallbackQuery) -> bool:
+    if not await require_policies_or_block(query):
+        return False
+    if not user_has_active_uniqueizer_plan(query.from_user.id):
+        await query.answer("Нет доступа к Уникализатору.", show_alert=True)
+        return False
+    return True
+
+
+@dp.callback_query(F.data == f"{UCB}:uzhm")
+async def cb_uniqueizer_home(query: CallbackQuery, state: FSMContext):
+    if not await _uniqueizer_guard(query):
+        return
+    await state.clear()
+    await safe_edit_text(
+        query.message,
+        text_uniqueizer_screen_html(),
+        parse_mode="HTML",
+        reply_markup=kb_uniqueizer_hub(),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == f"{UCB}:uzrun")
+async def cb_uniqueizer_run_start(query: CallbackQuery, state: FSMContext):
+    if not await _uniqueizer_guard(query):
+        return
+    await state.set_state(UniqueizerStates.uniq_media)
+    await state.set_data({})
+    await safe_edit_text(
+        query.message,
+        "📦 <b>Уникализация</b>\n\n"
+        "Отправьте <b>фото</b> или <b>видео</b> (можно как файл-документ).\n"
+        f"Максимум ~<b>{UNIQUEIZER_MAX_FILE_MB} МБ</b>.\n\n"
+        "Дальше при необходимости выберите шаблон и число копий.\n"
+        "/cancel — отмена.",
+        parse_mode="HTML",
+        reply_markup=kb_uniqueizer_cancel_hub(),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == f"{UCB}:uztpl")
+async def cb_uniqueizer_templates(query: CallbackQuery, state: FSMContext):
+    if not await _uniqueizer_guard(query):
+        return
+    uid = query.from_user.id
+    u = user_get(uid)
+    sel = _user_uniqueizer_selected_template_id(u)
+    rows = uniqueizer_templates_list(uid)
+    if not rows:
+        await safe_edit_text(
+            query.message,
+            "📋 <b>Шаблоны</b>\n\n"
+            "Пока нет ни одного шаблона — создайте первый.",
+            parse_mode="HTML",
+            reply_markup=kb_uniqueizer_tpl_empty(),
+        )
+        await query.answer()
+        return
+    lines = []
+    for row in rows:
+        tid = str(row.get("id") or "")
+        mark = "✓ " if sel == tid else ""
+        nm = esc_html((row.get("name") or "Шаблон")[:40])
+        lines.append(f"• {mark}<b>{nm}</b>")
+    body = "📋 <b>Шаблоны</b>\n\n" + "\n".join(lines)
+    body += "\n\nНажмите шаблон, чтобы сделать его <b>активным</b> (✓)."
+    await safe_edit_text(
+        query.message,
+        body,
+        parse_mode="HTML",
+        reply_markup=kb_uniqueizer_tpl_list(uid, rows, sel),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == f"{UCB}:uznew")
+async def cb_uniqueizer_tpl_new(query: CallbackQuery, state: FSMContext):
+    if not await _uniqueizer_guard(query):
+        return
+    await state.set_state(UniqueizerStates.tpl_name)
+    await state.set_data({"uz_tpl_opts": []})
+    await safe_edit_text(
+        query.message,
+        "➕ <b>Новый шаблон</b>\n\n"
+        "Введите <b>название</b> шаблона одним сообщением.\n"
+        "/cancel — отмена.",
+        parse_mode="HTML",
+        reply_markup=kb_uniqueizer_cancel_hub(),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data.startswith(f"{UCB}:uztgl:"))
+async def cb_uniqueizer_tpl_toggle(query: CallbackQuery, state: FSMContext):
+    if not await _uniqueizer_guard(query):
+        return
+    if await state.get_state() != UniqueizerStates.tpl_build:
+        await query.answer("Сначала создайте шаблон.", show_alert=True)
+        return
+    key = (query.data or "").split(":")[-1]
+    if key not in UNIQUEIZER_OPTION_KEYS:
+        await query.answer()
+        return
+    data = await state.get_data()
+    opts: list[str] = list(data.get("uz_tpl_opts") or [])
+    if key in opts:
+        opts = [x for x in opts if x != key]
+    else:
+        opts = list(opts) + [key]
+    await state.update_data(uz_tpl_opts=opts)
+    try:
+        await query.message.edit_reply_markup(reply_markup=kb_uniqueizer_tpl_build(set(opts)))
+    except TelegramBadRequest:
+        pass
+    await query.answer()
+
+
+@dp.callback_query(F.data == f"{UCB}:uzfin")
+async def cb_uniqueizer_tpl_finish(query: CallbackQuery, state: FSMContext):
+    if not await _uniqueizer_guard(query):
+        return
+    if await state.get_state() != UniqueizerStates.tpl_build:
+        await query.answer()
+        return
+    data = await state.get_data()
+    name = (data.get("uz_tpl_name") or "").strip() or "Шаблон"
+    opts: list[str] = list(data.get("uz_tpl_opts") or [])
+    uid = query.from_user.id
+    tid_new = uniqueizer_template_insert_row(uid, name, opts)
+    if not tid_new:
+        await query.answer("Ошибка сохранения в базу (таблица uniqueizer_templates?).", show_alert=True)
+        return
+    user_set_uniqueizer_selected_template(uid, tid_new)
+    await state.clear()
+    await safe_edit_text(
+        query.message,
+        f"✅ Шаблон <b>{esc_html(name[:80])}</b> создан и выбран.\n"
+        f"Опций: <b>{len(opts)}</b>.",
+        parse_mode="HTML",
+        reply_markup=kb_uniqueizer_hub(),
+    )
+    await query.answer("Сохранено")
+
+
+@dp.callback_query(F.data.startswith(f"{UCB}:uzsel:"))
+async def cb_uniqueizer_tpl_select(query: CallbackQuery, state: FSMContext):
+    if not await _uniqueizer_guard(query):
+        return
+    parts = (query.data or "").split(":")
+    if len(parts) < 3:
+        await query.answer()
+        return
+    tpl_id = parts[2]
+    uid = query.from_user.id
+    row = uniqueizer_template_get_row(tpl_id)
+    if not row or int(row.get("telegram_id") or 0) != uid:
+        await query.answer("Чужой шаблон.", show_alert=True)
+        return
+    user_set_uniqueizer_selected_template(uid, tpl_id)
+    cur = await state.get_state()
+    if cur == UniqueizerStates.uniq_wait_tpl:
+        data = await state.get_data()
+        mpath = data.get("uz_media_path")
+        is_vid = bool(data.get("uz_is_video"))
+        if mpath and os.path.isfile(mpath):
+            await state.set_state(UniqueizerStates.uniq_copies)
+            await state.update_data(uz_template_id=tpl_id, uz_media_path=mpath, uz_is_video=is_vid)
+            nm = esc_html((row.get("name") or "Шаблон")[:60])
+            await safe_edit_text(
+                query.message,
+                f"✅ Шаблон <b>{nm}</b> выбран.\n\n"
+                "Сколько <b>копий</b> сделать из загруженного файла?",
+                parse_mode="HTML",
+                reply_markup=kb_uniqueizer_copies_pick(),
+            )
+            await query.answer()
+            return
+        await state.set_state(UniqueizerStates.uniq_media)
+        await query.answer("Файл устарел — загрузите медиа снова.", show_alert=True)
+        return
+    await cb_uniqueizer_templates(query, state)
+
+
+@dp.callback_query(F.data.startswith(f"{UCB}:uzcp:"))
+async def cb_uniqueizer_do_copies(query: CallbackQuery, state: FSMContext):
+    if not await _uniqueizer_guard(query):
+        return
+    if await state.get_state() != UniqueizerStates.uniq_copies:
+        await query.answer()
+        return
+    try:
+        n = int((query.data or "").split(":")[-1])
+    except ValueError:
+        await query.answer()
+        return
+    n = max(1, min(UNIQUEIZER_MAX_COPIES, n))
+    data = await state.get_data()
+    mpath = data.get("uz_media_path")
+    is_vid = bool(data.get("uz_is_video"))
+    tpl_id = data.get("uz_template_id")
+    if not mpath or not os.path.isfile(mpath):
+        await query.answer("Файл не найден. Начните снова.", show_alert=True)
+        await state.clear()
+        return
+    row = uniqueizer_template_get_row(str(tpl_id)) if tpl_id else None
+    opts = _template_options_from_row(row) if row else []
+    await query.answer("⏳ Обрабатываю…")
+    try:
+        zip_p, err = await asyncio.to_thread(
+            _uniqueizer_process_to_zip,
+            mpath,
+            is_video=is_vid,
+            options=opts,
+            copies=n,
+        )
+        if err or not zip_p:
+            await query.message.answer(
+                f"⚠️ {esc_html(err or 'ошибка')}",
+                parse_mode="HTML",
+                reply_markup=kb_uniqueizer_hub(),
+            )
+        else:
+            try:
+                await query.message.answer_document(
+                    FSInputFile(zip_p, filename="unique_pack.zip"),
+                    caption=f"✅ Готово: <b>{n}</b> копий.",
+                    parse_mode="HTML",
+                )
+            finally:
+                try:
+                    os.remove(zip_p)
+                except OSError:
+                    pass
+    finally:
+        try:
+            os.remove(mpath)
+        except OSError:
+            pass
+        await state.clear()
+    await query.message.answer(
+        "🎯 <b>Уникализатор</b>",
+        parse_mode="HTML",
+        reply_markup=kb_uniqueizer_hub(),
+    )
+
+
+@dp.message(UniqueizerStates.tpl_name, F.text)
+async def uniqueizer_tpl_name_message(message: Message, state: FSMContext):
+    if not user_has_active_uniqueizer_plan(message.from_user.id):
+        await state.clear()
+        return
+    raw = (message.text or "").strip()
+    if raw.startswith("/"):
+        return
+    if len(raw) < 1 or len(raw) > 120:
+        await message.answer("Название от 1 до 120 символов.")
+        return
+    await state.update_data(uz_tpl_name=raw, uz_tpl_opts=[])
+    await state.set_state(UniqueizerStates.tpl_build)
+    await message.answer(
+        "Отметьте нужные <b>опции</b> (можно несколько), затем нажмите <b>Выбрать</b>.",
+        parse_mode="HTML",
+        reply_markup=kb_uniqueizer_tpl_build(set()),
+    )
+
+
+@dp.message(UniqueizerStates.uniq_media, F.photo | F.video | F.document)
+async def uniqueizer_receive_media(message: Message, state: FSMContext):
+    if not user_has_active_uniqueizer_plan(message.from_user.id):
+        await state.clear()
+        return
+    if not bot:
+        return
+    uid = message.from_user.id
+    file_id: Optional[str] = None
+    suffix = ".bin"
+    is_video = False
+    size_b: Optional[int] = None
+
+    if message.photo:
+        ph = message.photo[-1]
+        file_id = ph.file_id
+        suffix = ".jpg"
+        size_b = getattr(ph, "file_size", None)
+    elif message.video:
+        file_id = message.video.file_id
+        suffix = ".mp4"
+        is_video = True
+        size_b = getattr(message.video, "file_size", None)
+    elif message.document:
+        doc = message.document
+        mt = (doc.mime_type or "").lower()
+        if not (mt.startswith("image/") or mt.startswith("video/")):
+            await message.answer("Нужен файл с типом изображение или видео.")
+            return
+        file_id = doc.file_id
+        is_video = mt.startswith("video/")
+        suffix = ".mp4" if is_video else ".jpg"
+        size_b = getattr(doc, "file_size", None)
+
+    if not file_id:
+        return
+    if size_b is not None and size_b > UNIQUEIZER_MAX_FILE_MB * 1024 * 1024:
+        await message.answer(f"Файл слишком большой (лимит {UNIQUEIZER_MAX_FILE_MB} МБ).")
+        return
+
+    path, err = await _download_tg_file(bot, file_id, suffix=suffix)
+    if err or not path:
+        await message.answer(f"Не удалось скачать файл: {esc_html(err or 'ошибка')}", parse_mode="HTML")
+        return
+
+    u = user_get(uid)
+    sel = _user_uniqueizer_selected_template_id(u)
+    if not sel:
+        await state.set_state(UniqueizerStates.uniq_wait_tpl)
+        await state.update_data(uz_media_path=path, uz_is_video=is_video)
+        await message.answer(
+            "Сначала выберите <b>шаблон</b> для уникализации.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="📋 Шаблоны", callback_data=f"{UCB}:uztpl")],
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data=f"{UCB}:uzhm")],
+                ]
+            ),
+        )
+        return
+
+    row = uniqueizer_template_get_row(sel)
+    if not row or int(row.get("telegram_id") or 0) != uid:
+        user_set_uniqueizer_selected_template(uid, None)
+        await state.set_state(UniqueizerStates.uniq_wait_tpl)
+        await state.update_data(uz_media_path=path, uz_is_video=is_video)
+        await message.answer(
+            "Активный шаблон недоступен. Выберите другой.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="📋 Шаблоны", callback_data=f"{UCB}:uztpl")],
+                ]
+            ),
+        )
+        return
+
+    await state.set_state(UniqueizerStates.uniq_copies)
+    await state.update_data(uz_media_path=path, uz_is_video=is_video, uz_template_id=sel)
+    nm = esc_html((row.get("name") or "Шаблон")[:60])
+    await message.answer(
+        f"Шаблон: <b>{nm}</b>\n\n"
+        "Сколько <b>копий</b> сделать?",
+        parse_mode="HTML",
+        reply_markup=kb_uniqueizer_copies_pick(),
+    )
+
+
+@dp.message(UniqueizerStates.uniq_media, F.text)
+async def uniqueizer_media_hint_text(message: Message, state: FSMContext):
+    if not user_has_active_uniqueizer_plan(message.from_user.id):
+        await state.clear()
+        return
+    if (message.text or "").strip().startswith("/"):
+        return
+    await message.answer(
+        "Пришлите <b>фото</b> или <b>видео</b> (или документ image/* / video/*).",
+        parse_mode="HTML",
+    )
 
 
 @dp.callback_query(F.data == f"{UCB}:team_cancel")
@@ -4412,6 +5145,14 @@ async def cmd_cancel(message: Message, state: FSMContext):
             telegram_user_id=message.from_user.id,
             telegram_username=message.from_user.username if message.from_user else None,
             anchor_message=None,
+        )
+        return
+    cur_uz = await state.get_state()
+    if cur_uz and str(cur_uz).startswith("UniqueizerStates"):
+        await state.clear()
+        await message.answer(
+            "Уникализатор: отменено.",
+            reply_markup=kb_uniqueizer_hub(),
         )
         return
     if not is_admin(message.from_user.id):
