@@ -759,6 +759,79 @@ UNIQUEIZER_OPTION_DEFS: tuple[tuple[str, str], ...] = (
 )
 UNIQUEIZER_OPTION_KEYS = frozenset(k for k, _ in UNIQUEIZER_OPTION_DEFS)
 UNIQUEIZER_OPT_LABEL = dict(UNIQUEIZER_OPTION_DEFS)
+# Интенсивность опции в шаблоне: 0 = выкл, 1 = слабо, 2 = средне, 3 = сильно (для отражений — реже / чаще / всегда).
+UNIQUEIZER_LEVEL_LABELS = ("—", "слаб", "сред", "силь")
+UNIQUEIZER_LEGACY_LIST_LEVEL = 2
+
+
+def _uz_level_clamp(lv: int) -> int:
+    return max(0, min(3, int(lv)))
+
+
+def _uz_tpl_levels_empty() -> dict[str, int]:
+    return {k: 0 for k in UNIQUEIZER_OPTION_KEYS}
+
+
+def _uz_intensity_mult(lv: int) -> float:
+    """Множитель силы эффекта для уровня 1..3."""
+    if lv <= 0:
+        return 0.0
+    return (0.55, 1.0, 1.75)[lv - 1]
+
+
+def _template_levels_from_row(row: dict) -> dict[str, int]:
+    """Читает options: новый формат dict[str,int], legacy — список строк (уровень «средне»)."""
+    out = _uz_tpl_levels_empty()
+    raw = row.get("options")
+    if raw is None:
+        return out
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return out
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            ks = str(k)
+            if ks not in UNIQUEIZER_OPTION_KEYS:
+                continue
+            try:
+                out[ks] = _uz_level_clamp(int(v))
+            except (TypeError, ValueError):
+                out[ks] = 0
+        return out
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                ks = str(item.get("k") or item.get("key") or "")
+                if ks not in UNIQUEIZER_OPTION_KEYS:
+                    continue
+                try:
+                    out[ks] = _uz_level_clamp(int(item.get("lv", item.get("level", UNIQUEIZER_LEGACY_LIST_LEVEL))))
+                except (TypeError, ValueError):
+                    out[ks] = UNIQUEIZER_LEGACY_LIST_LEVEL
+            else:
+                ks = str(item)
+                if ks in UNIQUEIZER_OPTION_KEYS:
+                    out[ks] = UNIQUEIZER_LEGACY_LIST_LEVEL
+        return out
+    return out
+
+
+def _uniqueizer_effective_levels(levels: dict[str, int]) -> dict[str, int]:
+    """Если все опции выкл — как раньше: лёгкая яркость + перекодирование JPEG/CRF."""
+    base = {k: _uz_level_clamp(int(levels.get(k) or 0)) for k in UNIQUEIZER_OPTION_KEYS}
+    if all(v == 0 for v in base.values()):
+        base["brightness"] = UNIQUEIZER_LEGACY_LIST_LEVEL
+        base["jpeg_q"] = UNIQUEIZER_LEGACY_LIST_LEVEL
+    return base
+
+
+def _uniqueizer_rng_seed(levels: dict[str, int], variant: int) -> int:
+    frozen = tuple(sorted((k, int(levels[k])) for k in UNIQUEIZER_OPTION_KEYS if int(levels.get(k) or 0) > 0))
+    if not frozen:
+        frozen = (("brightness", UNIQUEIZER_LEGACY_LIST_LEVEL), ("jpeg_q", UNIQUEIZER_LEGACY_LIST_LEVEL))
+    return variant * 13001 + (hash(frozen) % 999983)
 
 
 def _user_uniqueizer_selected_template_id(u: Optional[dict]) -> Optional[str]:
@@ -816,9 +889,13 @@ def uniqueizer_template_get_row(template_id: str) -> Optional[dict]:
         return None
 
 
-def uniqueizer_template_insert_row(telegram_id: int, name: str, options: list[str]) -> Optional[str]:
+def uniqueizer_template_insert_row(telegram_id: int, name: str, levels: dict[str, int]) -> Optional[str]:
     nm = (name or "").strip()[:120] or "Шаблон"
-    opts = [x for x in options if x in UNIQUEIZER_OPTION_KEYS]
+    opts_obj = {
+        k: _uz_level_clamp(int(v))
+        for k, v in (levels or {}).items()
+        if k in UNIQUEIZER_OPTION_KEYS and _uz_level_clamp(int(v)) > 0
+    }
     now = int(time.time())
     try:
         r = (
@@ -827,7 +904,7 @@ def uniqueizer_template_insert_row(telegram_id: int, name: str, options: list[st
                 {
                     "telegram_id": telegram_id,
                     "name": nm,
-                    "options": opts,
+                    "options": opts_obj,
                     "created_at": now,
                 }
             )
@@ -838,22 +915,6 @@ def uniqueizer_template_insert_row(telegram_id: int, name: str, options: list[st
     except Exception as e:
         print(f"uniqueizer_template_insert_row: {e}")
     return None
-
-
-def _template_options_from_row(row: dict) -> list[str]:
-    raw = row.get("options")
-    if raw is None:
-        return []
-    if isinstance(raw, list):
-        return [str(x) for x in raw if str(x) in UNIQUEIZER_OPTION_KEYS]
-    if isinstance(raw, str):
-        try:
-            parsed = json.loads(raw)
-            if isinstance(parsed, list):
-                return [str(x) for x in parsed if str(x) in UNIQUEIZER_OPTION_KEYS]
-        except json.JSONDecodeError:
-            pass
-    return []
 
 
 def kb_uniqueizer_hub() -> InlineKeyboardMarkup:
@@ -904,15 +965,17 @@ def kb_uniqueizer_tpl_list(uid: int, rows: list[dict], selected_id: Optional[str
     return InlineKeyboardMarkup(inline_keyboard=lines)
 
 
-def kb_uniqueizer_tpl_build(selected: set[str]) -> InlineKeyboardMarkup:
+def kb_uniqueizer_tpl_build(levels: dict[str, int]) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     row_buf: list[InlineKeyboardButton] = []
     for key, label in UNIQUEIZER_OPTION_DEFS:
-        check = "✓ " if key in selected else ""
+        lv = _uz_level_clamp(int(levels.get(key) or 0))
+        tag = UNIQUEIZER_LEVEL_LABELS[lv]
+        short = (label[:14] + "…") if len(label) > 15 else label
         row_buf.append(
             InlineKeyboardButton(
-                text=f"{check}{label[:18]}",
-                callback_data=f"{UCB}:uztgl:{key}",
+                text=f"{short} ·{tag}",
+                callback_data=f"{UCB}:uzcyc:{key}",
             )
         )
         if len(row_buf) >= 2:
@@ -960,43 +1023,75 @@ def _ffmpeg_bin() -> Optional[str]:
     return None
 
 
-def _ffmpeg_vf_for_uniqueize_image(opts: set[str], variant: int, rng: random.Random) -> str:
-    """Цепочка фильтров libavfilter для одного кадра (фото)."""
-    use = opts if opts else {"jpeg_q", "brightness"}
+def _uz_flip_h_on(level: int, variant: int) -> bool:
+    if level <= 0:
+        return False
+    if level >= 3:
+        return (variant % 2) == 0
+    if level >= 2:
+        return (variant % 2) == 0
+    return (variant % 6) == 0
+
+
+def _uz_flip_v_on(level: int, variant: int) -> bool:
+    if level <= 0:
+        return False
+    if level >= 3:
+        return (variant % 2) == 1
+    if level >= 2:
+        return (variant % 2) == 1
+    return (variant % 6) == 3
+
+
+def _ffmpeg_vf_for_uniqueize_image(levels: dict[str, int], variant: int, rng: random.Random) -> str:
+    """Цепочка фильтров libavfilter для одного кадра (фото). levels — уже effective."""
     parts: list[str] = []
-    if "flip_h" in use and (variant % 2) == 0:
+    if _uz_flip_h_on(levels.get("flip_h", 0), variant):
         parts.append("hflip")
-    if "flip_v" in use and (variant % 2) == 1:
+    if _uz_flip_v_on(levels.get("flip_v", 0), variant):
         parts.append("vflip")
     br, ctr, sat = 0.0, 1.0, 1.0
-    if "brightness" in use:
-        br += rng.uniform(-0.14, 0.14) + (variant % 7 - 3) * 0.018
-    if "contrast" in use:
-        ctr += rng.uniform(-0.18, 0.22) + (variant % 5) * 0.012
-    if "saturation" in use:
-        sat += rng.uniform(-0.32, 0.35) + (variant % 4) * 0.025
+    mb = _uz_intensity_mult(levels.get("brightness", 0))
+    mc = _uz_intensity_mult(levels.get("contrast", 0))
+    ms = _uz_intensity_mult(levels.get("saturation", 0))
+    if mb > 0:
+        br += (rng.uniform(-0.14, 0.14) + (variant % 7 - 3) * 0.018) * mb
+    if mc > 0:
+        ctr += (rng.uniform(-0.18, 0.22) + (variant % 5) * 0.012) * mc
+    if ms > 0:
+        sat += (rng.uniform(-0.32, 0.35) + (variant % 4) * 0.025) * ms
     if abs(br) > 1e-6 or abs(ctr - 1.0) > 1e-6 or abs(sat - 1.0) > 1e-6:
         parts.append(f"eq=brightness={br:.5f}:contrast={ctr:.5f}:saturation={sat:.5f}")
-    if "saturation" in use:
-        hue = ((variant * 23) % 90 - 45) + rng.uniform(-8.0, 8.0)
-        parts.append(f"hue=h={hue}*PI/180")
-    if "sharpen" in use:
-        parts.append(
-            f"unsharp=5:5:{0.45 + variant * 0.04:.2f}:5:5:{0.15 + (variant % 4) * 0.12:.2f}"
-        )
-    if "noise" in use:
-        n = 12 + (variant % 18) * 3
+    if ms > 0:
+        hue_amp = 25 + 55 * ms
+        hue = ((variant * 23) % int(2 * hue_amp) - hue_amp) + rng.uniform(-10.0, 10.0) * ms
+        sat_h = 0.85 + 0.22 * ms + (variant % 5) * 0.04 * ms
+        parts.append(f"hue=h={hue}*PI/180:s={sat_h:.4f}")
+    m_sh = _uz_intensity_mult(levels.get("sharpen", 0))
+    if m_sh > 0:
+        lx = 0.35 + variant * 0.05 * m_sh
+        ly = 0.12 + (variant % 4) * 0.14 * m_sh
+        parts.append(f"unsharp=5:5:{lx:.2f}:5:5:{ly:.2f}")
+    m_n = _uz_intensity_mult(levels.get("noise", 0))
+    if m_n > 0:
+        n = int((12 + (variant % 18) * 3) * (0.7 + m_n))
         parts.append(f"noise=alls={n}:allf=t+u")
-    if "resize_pct" in use:
-        sc = 100 + (variant % 11 - 5)
+    m_rs = _uz_intensity_mult(levels.get("resize_pct", 0))
+    if m_rs > 0:
+        span = 3 + int(8 * m_rs)
+        sc = 100 + (variant % (2 * span + 1) - span)
         parts.append(f"scale=iw*{sc}/100:-2:flags=lanczos")
-    if "rot_small" in use:
-        parts.append(f"gblur=sigma={0.12 + (variant % 6) * 0.07 + rng.random() * 0.12:.3f}")
-        vang = 0.45 + (variant % 7) * 0.09
+    m_rot = _uz_intensity_mult(levels.get("rot_small", 0))
+    if m_rot > 0:
+        sig = (0.1 + (variant % 6) * 0.06 + rng.random() * 0.14) * m_rot
+        parts.append(f"gblur=sigma={sig:.3f}")
+        vang = (0.4 + (variant % 7) * 0.1) * m_rot
         parts.append(f"vignette={vang:.4f}")
     if not parts:
+        mb2 = max(mb, 0.35)
         parts.append(
-            f"eq=brightness={(variant % 5 - 2) * 0.025:.5f}:contrast={1.02 + (variant % 5) * 0.015:.5f}"
+            f"eq=brightness={(variant % 5 - 2) * 0.028 * mb2:.5f}:"
+            f"contrast={1.0 + (0.02 + (variant % 5) * 0.018) * mb2:.5f}"
         )
     return ",".join(parts)
 
@@ -1036,20 +1131,78 @@ def _uniqueizer_path_looks_like_video(media_path: str) -> bool:
     return os.path.splitext(media_path)[1].lower() in _UNIQUEIZER_VIDEO_EXTS
 
 
+def _ffmpeg_vf_for_uniqueize_video(levels: dict[str, int], variant: int, rng: random.Random) -> str:
+    """Цепочка фильтров для видео (те же опции шаблона, что и для фото)."""
+    parts: list[str] = []
+    if _uz_flip_h_on(levels.get("flip_h", 0), variant):
+        parts.append("hflip")
+    if _uz_flip_v_on(levels.get("flip_v", 0), variant):
+        parts.append("vflip")
+    br, ctr, sat = 0.0, 1.0, 1.0
+    mb = _uz_intensity_mult(levels.get("brightness", 0))
+    mc = _uz_intensity_mult(levels.get("contrast", 0))
+    ms = _uz_intensity_mult(levels.get("saturation", 0))
+    if mb > 0:
+        br += (rng.uniform(-0.12, 0.12) + (variant % 7 - 3) * 0.016) * mb
+    if mc > 0:
+        ctr += (rng.uniform(-0.16, 0.2) + (variant % 5) * 0.011) * mc
+    if ms > 0:
+        sat += (rng.uniform(-0.28, 0.32) + (variant % 4) * 0.022) * ms
+    if abs(br) > 1e-6 or abs(ctr - 1.0) > 1e-6 or abs(sat - 1.0) > 1e-6:
+        parts.append(f"eq=brightness={br:.5f}:contrast={ctr:.5f}:saturation={sat:.5f}")
+    if ms > 0:
+        hue_amp = 22 + 48 * ms
+        hue = ((variant * 19) % int(2 * hue_amp) - hue_amp) + rng.uniform(-9.0, 9.0) * ms
+        sat_h = 0.88 + 0.2 * ms + (variant % 5) * 0.035 * ms
+        parts.append(f"hue=h={hue}*PI/180:s={sat_h:.4f}")
+    elif mb > 0 or mc > 0:
+        hue = (variant * 13) % 40 - 20
+        parts.append(f"hue=h={hue}*PI/180:s=1.0")
+    m_sh = _uz_intensity_mult(levels.get("sharpen", 0))
+    if m_sh > 0:
+        lx = 0.3 + variant * 0.045 * m_sh
+        ly = 0.1 + (variant % 4) * 0.12 * m_sh
+        parts.append(f"unsharp=5:5:{lx:.2f}:5:5:{ly:.2f}")
+    m_n = _uz_intensity_mult(levels.get("noise", 0))
+    if m_n > 0:
+        n = int((10 + (variant % 16) * 2) * (0.75 + m_n))
+        parts.append(f"noise=alls={n}:allf=t+u")
+    m_rs = _uz_intensity_mult(levels.get("resize_pct", 0))
+    if m_rs > 0:
+        span = 2 + int(6 * m_rs)
+        sc = 100 + (variant % (2 * span + 1) - span)
+        parts.append(f"scale=iw*{sc}/100:-2:flags=lanczos")
+    m_rot = _uz_intensity_mult(levels.get("rot_small", 0))
+    if m_rot > 0:
+        sig = (0.08 + (variant % 5) * 0.05 + rng.random() * 0.1) * m_rot
+        parts.append(f"gblur=sigma={sig:.3f}")
+        vang = (0.35 + (variant % 6) * 0.085) * m_rot
+        parts.append(f"vignette={vang:.4f}")
+    if not parts:
+        hue = ((variant * 17) % 50) - 25
+        parts.append(f"hue=h={hue}*PI/180:s={0.92 + (variant % 5) * 0.035:.4f}")
+    return ",".join(parts)
+
+
 def _ffmpeg_transcode_video_copy(
     ffmpeg_exe: str,
     media_path: str,
     out_path: str,
     variant_index: int,
+    levels: dict[str, int],
 ) -> tuple[bool, str]:
     """
-    Перекодирование одной копии видео (фильтр hue). Сначала libx264, иначе mpeg4 —
-    урезанные сборки ffmpeg часто без x264.
-    Возвращает (успех, текст_ошибки).
+    Перекодирование одной копии видео по настройкам шаблона. Сначала libx264, иначе mpeg4.
+    levels — уже effective (см. _uniqueizer_effective_levels).
     """
-    hue = ((variant_index * 17) % 50) - 25
-    sat = 0.9 + (variant_index % 5) * 0.04
-    vf = f"hue=h={hue}*PI/180:s={sat}"
+    rng = random.Random(_uniqueizer_rng_seed(levels, variant_index))
+    vf = _ffmpeg_vf_for_uniqueize_video(levels, variant_index, rng)
+    jq = int(levels.get("jpeg_q", 0) or 0)
+    jm = _uz_intensity_mult(jq)
+    crf_spread = max(5, int(5 + jm * 16))
+    crf = 17 + (variant_index % crf_spread) + (variant_index % 4)
+    crf = max(16, min(32, crf))
+    qv_mpeg = max(2, min(31, int(3 + (variant_index % 10) * (0.6 + jm * 0.5))))
     attempts: list[list[str]] = [
         [
             ffmpeg_exe,
@@ -1066,7 +1219,7 @@ def _ffmpeg_transcode_video_copy(
             "-preset",
             "veryfast",
             "-crf",
-            str(20 + (variant_index % 6)),
+            str(crf),
             "-pix_fmt",
             "yuv420p",
             "-an",
@@ -1087,7 +1240,7 @@ def _ffmpeg_transcode_video_copy(
             "-c:v",
             "mpeg4",
             "-q:v",
-            str(3 + (variant_index % 8)),
+            str(qv_mpeg),
             "-an",
             out_path,
         ],
@@ -1119,50 +1272,62 @@ def _ffmpeg_transcode_video_copy(
     return False, (last_err or "неизвестная ошибка ffmpeg")[:900]
 
 
-def _apply_uniqueizer_pil(im: Image.Image, options: list[str], variant: int) -> Image.Image:
-    rng = random.Random(variant * 13001 + (hash(tuple(sorted(options))) % 999983))
+def _apply_uniqueizer_pil(im: Image.Image, levels: dict[str, int], variant: int) -> Image.Image:
+    rng = random.Random(_uniqueizer_rng_seed(levels, variant))
     img = im.convert("RGB")
-    opts = set(options) if options else {"jpeg_q", "brightness"}
-    if "flip_h" in opts and (variant % 3) != 0:
+    if _uz_flip_h_on(levels.get("flip_h", 0), variant):
         img = ImageOps.mirror(img)
-    if "flip_v" in opts and (variant % 3) == 1:
+    if _uz_flip_v_on(levels.get("flip_v", 0), variant):
         img = ImageOps.flip(img)
-    if "rot_small" in opts:
-        ang = rng.uniform(-2.1, 2.1) + (variant % 7) * 0.15
+    m_rot = _uz_intensity_mult(levels.get("rot_small", 0))
+    if m_rot > 0:
+        ang = (rng.uniform(-2.1, 2.1) + (variant % 7) * 0.15) * m_rot
         img = img.rotate(ang, resample=Image.BICUBIC, expand=False, fillcolor=(255, 255, 255))
-    if "brightness" in opts:
-        f = 1.0 + rng.uniform(-0.07, 0.07) + (variant % 5) * 0.003
+    mb = _uz_intensity_mult(levels.get("brightness", 0))
+    if mb > 0:
+        f = 1.0 + (rng.uniform(-0.07, 0.07) + (variant % 5) * 0.003) * mb
         img = ImageEnhance.Brightness(img).enhance(f)
-    if "contrast" in opts:
-        f = 1.0 + rng.uniform(-0.09, 0.09)
+    mc = _uz_intensity_mult(levels.get("contrast", 0))
+    if mc > 0:
+        f = 1.0 + rng.uniform(-0.09, 0.09) * mc
         img = ImageEnhance.Contrast(img).enhance(f)
-    if "saturation" in opts:
-        f = 1.0 + rng.uniform(-0.14, 0.14)
+    ms = _uz_intensity_mult(levels.get("saturation", 0))
+    if ms > 0:
+        f = 1.0 + rng.uniform(-0.14, 0.14) * ms
         img = ImageEnhance.Color(img).enhance(f)
-    if "sharpen" in opts:
-        f = 1.0 + rng.uniform(0.05, 0.35)
+    m_sh = _uz_intensity_mult(levels.get("sharpen", 0))
+    if m_sh > 0:
+        f = 1.0 + rng.uniform(0.05, 0.35) * m_sh
         img = ImageEnhance.Sharpness(img).enhance(f)
-    if "resize_pct" in opts:
+    m_rs = _uz_intensity_mult(levels.get("resize_pct", 0))
+    if m_rs > 0:
         w, h = img.size
-        sc = 1.0 + (variant % 5 - 2) * 0.0045 + rng.uniform(-0.002, 0.002)
+        span = 0.0045 * m_rs
+        sc = 1.0 + (variant % 5 - 2) * span + rng.uniform(-span * 0.5, span * 0.5)
         nw, nh = max(2, int(w * sc)), max(2, int(h * sc))
         img = img.resize((nw, nh), Image.LANCZOS)
         img = ImageOps.fit(img, (w, h), Image.LANCZOS)
-    if "noise" in opts:
+    m_n = _uz_intensity_mult(levels.get("noise", 0))
+    if m_n > 0:
         px = img.load()
         mw, mh = img.size
-        n_pix = max(80, mw * mh // 6000)
+        base = max(80, mw * mh // 6000)
+        n_pix = int(base * (0.6 + m_n))
+        dmax = min(12, 3 + int(4 * m_n))
         for _ in range(n_pix):
             x, y = rng.randint(0, mw - 1), rng.randint(0, mh - 1)
             r, g, b = px[x, y]
-            d = rng.randint(-5, 5)
+            d = rng.randint(-dmax, dmax)
             px[x, y] = (
                 max(0, min(255, r + d)),
                 max(0, min(255, g + d)),
                 max(0, min(255, b + d)),
             )
-    if "jpeg_q" in opts:
-        q = 68 + (variant * 5) % 24
+    jq = _uz_intensity_mult(levels.get("jpeg_q", 0))
+    if jq > 0:
+        spread = int(10 + 14 * jq)
+        q = int(58 + (variant * 7) % spread)
+        q = max(45, min(92, q))
         bio = io.BytesIO()
         img.save(bio, format="JPEG", quality=q, optimize=True)
         bio.seek(0)
@@ -1174,11 +1339,12 @@ def _uniqueizer_process_to_zip(
     media_path: str,
     *,
     is_video: bool,
-    options: list[str],
+    template_levels: dict[str, int],
     copies: int,
 ) -> tuple[Optional[str], str]:
     """Возвращает (путь к zip или None, сообщение об ошибке пользователю)."""
     copies = max(1, min(UNIQUEIZER_MAX_COPIES, int(copies)))
+    eff = _uniqueizer_effective_levels(template_levels or {})
     work = tempfile.mkdtemp(prefix="uz_")
     try:
         if _uniqueizer_path_looks_like_video(media_path):
@@ -1207,7 +1373,7 @@ def _uniqueizer_process_to_zip(
                 if is_video:
                     out_v = os.path.join(work, f"u_{i+1:03d}{ext}")
                     ok_v, err_v = _ffmpeg_transcode_video_copy(
-                        ffmpeg_exe, media_path, out_v, i
+                        ffmpeg_exe, media_path, out_v, i, eff
                     )
                     if not ok_v:
                         return None, (
@@ -1219,15 +1385,13 @@ def _uniqueizer_process_to_zip(
                     zf.write(out_v, arcname=f"unique_{i+1:03d}{ext}")
                 else:
                     out_p = os.path.join(work, f"u_{i+1:03d}.jpg")
-                    opts_set = set(options) if options else set()
                     ok_ffmpeg = False
                     if ffmpeg_exe:
-                        rng = random.Random(
-                            i * 13001 + (hash(tuple(sorted(options))) % 999983)
-                        )
-                        vf = _ffmpeg_vf_for_uniqueize_image(opts_set, i, rng)
-                        if "jpeg_q" in opts_set:
-                            qv = 3 + (i * 4) % 14
+                        rng = random.Random(_uniqueizer_rng_seed(eff, i))
+                        vf = _ffmpeg_vf_for_uniqueize_image(eff, i, rng)
+                        jm = _uz_intensity_mult(eff.get("jpeg_q", 0))
+                        if jm > 0:
+                            qv = 2 + (i * 4) % max(8, int(6 + 12 * jm))
                         else:
                             qv = 3 + (i * 2) % 6
                         try:
@@ -1244,7 +1408,7 @@ def _uniqueizer_process_to_zip(
                             )
                         try:
                             im = Image.open(media_path)
-                            out_img = _apply_uniqueizer_pil(im, options, i)
+                            out_img = _apply_uniqueizer_pil(im, eff, i)
                             out_img.save(out_p, format="JPEG", quality=88, optimize=True)
                         except Exception as e:
                             return None, f"Ошибка обработки изображения: {e}"
@@ -3977,7 +4141,7 @@ async def cb_uniqueizer_tpl_new(query: CallbackQuery, state: FSMContext):
     if not await _uniqueizer_guard(query):
         return
     await state.set_state(UniqueizerStates.tpl_name)
-    await state.set_data({"uz_tpl_opts": []})
+    await state.set_data({"uz_tpl_levels": _uz_tpl_levels_empty()})
     await safe_edit_text(
         query.message,
         "➕ <b>Новый шаблон</b>\n\n"
@@ -3989,8 +4153,8 @@ async def cb_uniqueizer_tpl_new(query: CallbackQuery, state: FSMContext):
     await query.answer()
 
 
-@dp.callback_query(F.data.startswith(f"{UCB}:uztgl:"))
-async def cb_uniqueizer_tpl_toggle(query: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data.startswith(f"{UCB}:uzcyc:"))
+async def cb_uniqueizer_tpl_cycle_level(query: CallbackQuery, state: FSMContext):
     if not await _uniqueizer_guard(query):
         return
     if await state.get_state() != UniqueizerStates.tpl_build:
@@ -4001,17 +4165,15 @@ async def cb_uniqueizer_tpl_toggle(query: CallbackQuery, state: FSMContext):
         await query.answer()
         return
     data = await state.get_data()
-    opts: list[str] = list(data.get("uz_tpl_opts") or [])
-    if key in opts:
-        opts = [x for x in opts if x != key]
-    else:
-        opts = list(opts) + [key]
-    await state.update_data(uz_tpl_opts=opts)
+    levels: dict[str, int] = dict(data.get("uz_tpl_levels") or _uz_tpl_levels_empty())
+    cur = _uz_level_clamp(int(levels.get(key) or 0))
+    levels[key] = (cur + 1) % 4
+    await state.update_data(uz_tpl_levels=levels)
     try:
-        await query.message.edit_reply_markup(reply_markup=kb_uniqueizer_tpl_build(set(opts)))
+        await query.message.edit_reply_markup(reply_markup=kb_uniqueizer_tpl_build(levels))
     except TelegramBadRequest:
         pass
-    await query.answer()
+    await query.answer(UNIQUEIZER_LEVEL_LABELS[levels[key]])
 
 
 @dp.callback_query(F.data == f"{UCB}:uzfin")
@@ -4023,18 +4185,19 @@ async def cb_uniqueizer_tpl_finish(query: CallbackQuery, state: FSMContext):
         return
     data = await state.get_data()
     name = (data.get("uz_tpl_name") or "").strip() or "Шаблон"
-    opts: list[str] = list(data.get("uz_tpl_opts") or [])
+    levels: dict[str, int] = dict(data.get("uz_tpl_levels") or _uz_tpl_levels_empty())
     uid = query.from_user.id
-    tid_new = uniqueizer_template_insert_row(uid, name, opts)
+    tid_new = uniqueizer_template_insert_row(uid, name, levels)
     if not tid_new:
         await query.answer("Ошибка сохранения в базу (таблица uniqueizer_templates?).", show_alert=True)
         return
     user_set_uniqueizer_selected_template(uid, tid_new)
     await state.clear()
+    n_on = sum(1 for v in levels.values() if int(v or 0) > 0)
     await safe_edit_text(
         query.message,
         f"✅ Шаблон <b>{esc_html(name[:80])}</b> создан и выбран.\n"
-        f"Опций: <b>{len(opts)}</b>.",
+        f"Опций с силой &gt; 0: <b>{n_on}</b> (остальное — дефолтная лёгкая уникализация).",
         parse_mode="HTML",
         reply_markup=kb_uniqueizer_hub(),
     )
@@ -4102,14 +4265,14 @@ async def cb_uniqueizer_do_copies(query: CallbackQuery, state: FSMContext):
         await state.clear()
         return
     row = uniqueizer_template_get_row(str(tpl_id)) if tpl_id else None
-    opts = _template_options_from_row(row) if row else []
+    tpl_levels = _template_levels_from_row(row) if row else _uz_tpl_levels_empty()
     await query.answer("⏳ Обрабатываю…")
     try:
         zip_p, err = await asyncio.to_thread(
             _uniqueizer_process_to_zip,
             mpath,
             is_video=is_vid,
-            options=opts,
+            template_levels=tpl_levels,
             copies=n,
         )
         if err or not zip_p:
@@ -4154,12 +4317,13 @@ async def uniqueizer_tpl_name_message(message: Message, state: FSMContext):
     if len(raw) < 1 or len(raw) > 120:
         await message.answer("Название от 1 до 120 символов.")
         return
-    await state.update_data(uz_tpl_name=raw, uz_tpl_opts=[])
+    await state.update_data(uz_tpl_name=raw, uz_tpl_levels=_uz_tpl_levels_empty())
     await state.set_state(UniqueizerStates.tpl_build)
     await message.answer(
-        "Отметьте нужные <b>опции</b> (можно несколько), затем нажмите <b>Выбрать</b>.",
+        "Нажимайте кнопки: цикл <b>выкл → слабо → средне → сильно</b> для каждой функции.\n"
+        "Затем <b>Выбрать</b>. Для видео те же опции (ffmpeg): яркость, насыщенность, шум, масштаб и т.д.",
         parse_mode="HTML",
-        reply_markup=kb_uniqueizer_tpl_build(set()),
+        reply_markup=kb_uniqueizer_tpl_build(_uz_tpl_levels_empty()),
     )
 
 
