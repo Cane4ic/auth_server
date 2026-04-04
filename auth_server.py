@@ -698,6 +698,16 @@ def user_has_active_team_plan(telegram_id: int) -> bool:
     return int(u.get("subscription_until") or 0) >= int(time.time())
 
 
+def user_has_active_uniqueizer_plan(telegram_id: int) -> bool:
+    """Активная подписка с планом Uniqueizer (код u в users.subscription_plan)."""
+    u = user_get(telegram_id)
+    if not u:
+        return False
+    if (u.get("subscription_plan") or "").strip().lower() != "u":
+        return False
+    return int(u.get("subscription_until") or 0) >= int(time.time())
+
+
 def team_get_by_owner(owner_telegram_id: int) -> Optional[dict]:
     try:
         r = (
@@ -1664,6 +1674,7 @@ def kb_admin_tariff_plans():
             [InlineKeyboardButton(text="PRO", callback_data=f"{CB}:tpe:p")],
             [InlineKeyboardButton(text="MAX", callback_data=f"{CB}:tpe:m")],
             [InlineKeyboardButton(text="TEAM", callback_data=f"{CB}:tpe:t")],
+            [InlineKeyboardButton(text="UNIQUEIZER", callback_data=f"{CB}:tpe:u")],
             [InlineKeyboardButton(text="⬅️ Админ-меню", callback_data=f"{CB}:menu")],
         ]
     )
@@ -1775,7 +1786,7 @@ def kb_policies_accept():
 
 
 def kb_user_main_menu(telegram_user_id: Optional[int] = None):
-    """Главное меню пользователя: Профиль|Отзывы, Тарифы|Рефералы, Поддержка; «Команда» — только при активном TEAM."""
+    """Главное меню: Профиль|Отзывы, Тарифы|Рефералы, Уникализатор (всегда), «Команда» — при TEAM."""
     profile_btn = InlineKeyboardButton(text="👤 Профиль", callback_data=f"{UCB}:profile")
     # По требованию: «Отзывы» — просто картинка, поэтому всегда открываем callback.
     reviews_btn = InlineKeyboardButton(text="⭐ Отзывы", callback_data=f"{UCB}:reviews")
@@ -1796,6 +1807,10 @@ def kb_user_main_menu(telegram_user_id: Optional[int] = None):
         [profile_btn, reviews_btn],
         [tariffs_btn, referrals_btn],
     ]
+    if telegram_user_id is not None:
+        rows.append(
+            [InlineKeyboardButton(text="🎯 Уникализатор", callback_data=f"{UCB}:uniqueizer")]
+        )
     if telegram_user_id is not None and user_has_active_team_plan(telegram_user_id):
         rows.append(
             [InlineKeyboardButton(text="👥 Команда", callback_data=f"{UCB}:team")]
@@ -1841,6 +1856,22 @@ def text_tariffs_caption_html() -> str:
     )
 
 
+def text_uniqueizer_no_access_html() -> str:
+    raw = (os.environ.get("TEXT_UNIQUEIZER_NO_ACCESS") or "").strip()
+    if raw:
+        return raw
+    return (
+        "Для использования Уникализатора, пожалуйста приобретите подписку в разделе — <b>Тарифы</b>."
+    )
+
+
+def text_uniqueizer_screen_html() -> str:
+    raw = (os.environ.get("TEXT_UNIQUEIZER_SCREEN") or "").strip()
+    if raw:
+        return raw
+    return "🎯 <b>Уникализатор</b>\n\nРаздел в разработке."
+
+
 def kb_tariffs():
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1848,6 +1879,7 @@ def kb_tariffs():
             [InlineKeyboardButton(text="PRO", callback_data=f"{UCB}:tariff:p")],
             [InlineKeyboardButton(text="MAX", callback_data=f"{UCB}:tariff:m")],
             [InlineKeyboardButton(text="TEAM", callback_data=f"{UCB}:tariff:t")],
+            [InlineKeyboardButton(text="UNIQUEIZER", callback_data=f"{UCB}:tariff:u")],
             [InlineKeyboardButton(text="⬅️ Главное меню", callback_data=f"{UCB}:main")],
         ]
     )
@@ -1930,7 +1962,9 @@ def build_user_profile_public_text(tid: int, u: Optional[dict]) -> str:
     active = sub >= now
     active_word = "активна" if active else "неактивна"
     plan_code = (u.get("subscription_plan") or "").strip().lower()
-    plan_label = {"s": "STANDART", "p": "PRO", "m": "MAX", "t": "TEAM"}.get(plan_code, "—")
+    plan_label = {"s": "STANDART", "p": "PRO", "m": "MAX", "t": "TEAM", "u": "UNIQUEIZER"}.get(
+        plan_code, "—"
+    )
     username = (u.get("username") or "").strip() or "—"
     return (
         "👤 <b>Профиль</b>\n\n"
@@ -2253,7 +2287,7 @@ async def verify_subscription(telegram_id: int):
                 plan = plan.strip().lower()
             else:
                 plan = "m"
-            if plan not in ("s", "p", "m", "t"):
+            if plan not in ("s", "p", "m", "t", "u"):
                 plan = "m"
             return {"status": "success", "message": "Subscription active", "subscription_plan": plan}
     if team_member_has_active_team_access(telegram_id):
@@ -2420,23 +2454,25 @@ def tariffs_photo_for_new_message() -> Optional[object]:
     return None
 
 
-# Картинка карточки конкретного тарифа (STANDART / PRO / MAX). Первое непустое имя из кортежа.
+# Картинка карточки конкретного тарифа (STANDART / PRO / MAX / TEAM / UNIQUEIZER).
 _TARIFF_PLAN_IMAGE_PATH_KEYS: dict[str, tuple[str, ...]] = {
     "s": ("TARIFF_PLAN_IMAGE_PATH_S", "TARIFF_IMAGE_STANDART_PATH"),
     "p": ("TARIFF_PLAN_IMAGE_PATH_P", "TARIFF_IMAGE_PRO_PATH"),
     "m": ("TARIFF_PLAN_IMAGE_PATH_M", "TARIFF_IMAGE_MAX_PATH"),
     "t": ("TARIFF_PLAN_IMAGE_PATH_T", "TARIFF_IMAGE_TEAM_PATH"),
+    "u": ("TARIFF_PLAN_IMAGE_PATH_U", "TARIFF_IMAGE_UNIQUEIZER_PATH"),
 }
 _TARIFF_PLAN_IMAGE_URL_KEYS: dict[str, tuple[str, ...]] = {
     "s": ("TARIFF_PLAN_IMAGE_URL_S", "TARIFF_IMAGE_STANDART_URL"),
     "p": ("TARIFF_PLAN_IMAGE_URL_P", "TARIFF_IMAGE_PRO_URL"),
     "m": ("TARIFF_PLAN_IMAGE_URL_M", "TARIFF_IMAGE_MAX_URL"),
     "t": ("TARIFF_PLAN_IMAGE_URL_T", "TARIFF_IMAGE_TEAM_URL"),
+    "u": ("TARIFF_PLAN_IMAGE_URL_U", "TARIFF_IMAGE_UNIQUEIZER_URL"),
 }
 
 
 def tariff_plan_photo_for_plan(code: str) -> Optional[object]:
-    """Для карточки тарифа s|p|m|t: FSInputFile или URL. None — только текст (как раньше)."""
+    """Для карточки тарифа s|p|m|t|u: FSInputFile или URL. None — только текст (как раньше)."""
     if code not in _TARIFF_PLAN_IMAGE_PATH_KEYS:
         return None
     for ek in _TARIFF_PLAN_IMAGE_PATH_KEYS[code]:
@@ -3143,6 +3179,29 @@ async def cb_user_team_menu(query: CallbackQuery, state: FSMContext):
     await query.answer()
 
 
+@dp.callback_query(F.data == f"{UCB}:uniqueizer")
+async def cb_user_uniqueizer_menu(query: CallbackQuery):
+    if not await require_policies_or_block(query):
+        return
+    uid = query.from_user.id
+    if not user_has_active_uniqueizer_plan(uid):
+        await safe_edit_text(
+            query.message,
+            text_uniqueizer_no_access_html(),
+            parse_mode="HTML",
+            reply_markup=kb_user_back_main(),
+        )
+        await query.answer()
+        return
+    await safe_edit_text(
+        query.message,
+        text_uniqueizer_screen_html(),
+        parse_mode="HTML",
+        reply_markup=kb_user_back_main(),
+    )
+    await query.answer()
+
+
 @dp.callback_query(F.data == f"{UCB}:team_cancel")
 async def cb_user_team_setup_cancel(query: CallbackQuery, state: FSMContext):
     if not await require_policies_or_block(query):
@@ -3300,6 +3359,7 @@ _TARIFF_PLAN_ENV = {
     "p": "TEXT_PLAN_PRO",
     "m": "TEXT_PLAN_MAX",
     "t": "TEXT_PLAN_TEAM",
+    "u": "TEXT_PLAN_UNIQUEIZER",
 }
 # app_settings: полный HTML карточки тарифа (приоритет над TEXT_PLAN_* и _TARIFF_PLAN_DEFAULT).
 _TARIFF_PLAN_SETTINGS_KEYS = {
@@ -3307,6 +3367,7 @@ _TARIFF_PLAN_SETTINGS_KEYS = {
     "p": "tariff_plan_html_p",
     "m": "tariff_plan_html_m",
     "t": "tariff_plan_html_t",
+    "u": "tariff_plan_html_u",
 }
 _TARIFF_PLAN_DEFAULT = {
     "s": (
@@ -3351,6 +3412,12 @@ _TARIFF_PLAN_DEFAULT = {
         "(кнопка <b>«Команда»</b> в главном меню при активной подписке).\n\n"
         "Уточните цены и лимиты в поддержке или задайте <code>TEXT_PLAN_TEAM</code> в .env."
     ),
+    "u": (
+        "<b>UNIQUEIZER</b>\n\n"
+        "Тариф <b>Уникализатор</b>: доступ к разделу <b>«Уникализатор»</b> в главном меню бота.\n\n"
+        "Цены списания: <code>CRYPTO_PAY_AMOUNT_UNIQUEIZER</code> / продление "
+        "<code>CRYPTO_PAY_RENEW_AMOUNT_UNIQUEIZER</code> в .env."
+    ),
 }
 
 
@@ -3366,23 +3433,25 @@ def tariff_plan_body_html(code: str) -> str:
     return (os.environ.get(env_key) or "").strip() or _TARIFF_PLAN_DEFAULT[code]
 
 
-_PLAN_INVOICE_LABEL = {"s": "STANDART", "p": "PRO", "m": "MAX", "t": "TEAM"}
+_PLAN_INVOICE_LABEL = {"s": "STANDART", "p": "PRO", "m": "MAX", "t": "TEAM", "u": "UNIQUEIZER"}
 # Имена без суффикса _P (в Railway «сырой» ввод переменных ломает строки вроде ..._P=...).
 _PLAN_AMOUNT_ENV_KEYS = {
     "s": ("CRYPTO_PAY_AMOUNT_STANDART", "CRYPTO_PAY_AMOUNT_S"),
     "p": ("CRYPTO_PAY_AMOUNT_PRO", "CRYPTO_PAY_AMOUNT_P"),
     "m": ("CRYPTO_PAY_AMOUNT_MAX", "CRYPTO_PAY_AMOUNT_M"),
     "t": ("CRYPTO_PAY_AMOUNT_TEAM", "CRYPTO_PAY_AMOUNT_T"),
+    "u": ("CRYPTO_PAY_AMOUNT_UNIQUEIZER", "CRYPTO_PAY_AMOUNT_U"),
 }
-_PLAN_AMOUNT_DEFAULT = {"s": "0.1", "p": "0.15", "m": "0.2", "t": "0.25"}
+_PLAN_AMOUNT_DEFAULT = {"s": "0.1", "p": "0.15", "m": "0.2", "t": "0.25", "u": "0.26"}
 # Продление после истечения подписки (см. user_eligible_for_renewal_price).
 _PLAN_RENEW_AMOUNT_ENV_KEYS = {
     "s": ("CRYPTO_PAY_RENEW_AMOUNT_STANDART", "CRYPTO_PAY_RENEW_AMOUNT_S"),
     "p": ("CRYPTO_PAY_RENEW_AMOUNT_PRO", "CRYPTO_PAY_RENEW_AMOUNT_P"),
     "m": ("CRYPTO_PAY_RENEW_AMOUNT_MAX", "CRYPTO_PAY_RENEW_AMOUNT_M"),
     "t": ("CRYPTO_PAY_RENEW_AMOUNT_TEAM", "CRYPTO_PAY_RENEW_AMOUNT_T"),
+    "u": ("CRYPTO_PAY_RENEW_AMOUNT_UNIQUEIZER", "CRYPTO_PAY_RENEW_AMOUNT_U"),
 }
-_PLAN_RENEW_AMOUNT_DEFAULT = {"s": "0.08", "p": "0.12", "m": "0.18", "t": "0.2"}
+_PLAN_RENEW_AMOUNT_DEFAULT = {"s": "0.08", "p": "0.12", "m": "0.18", "t": "0.2", "u": "0.21"}
 
 
 def tariff_plan_invoice_label(code: str) -> str:
@@ -3408,8 +3477,9 @@ _PLAN_SUB_DAYS_ENV_KEYS = {
     "p": ("SUBSCRIPTION_DAYS_PRO", "SUBSCRIPTION_DAYS_P"),
     "m": ("SUBSCRIPTION_DAYS_MAX", "SUBSCRIPTION_DAYS_M"),
     "t": ("SUBSCRIPTION_DAYS_TEAM", "SUBSCRIPTION_DAYS_T"),
+    "u": ("SUBSCRIPTION_DAYS_UNIQUEIZER", "SUBSCRIPTION_DAYS_U"),
 }
-_PLAN_SUB_DAYS_DEFAULT = {"s": 30, "p": 30, "m": 30, "t": 30}
+_PLAN_SUB_DAYS_DEFAULT = {"s": 30, "p": 30, "m": 30, "t": 30, "u": 30}
 
 
 def subscription_days_for_plan(code: str) -> int:
@@ -4435,7 +4505,7 @@ async def cb_help(query: CallbackQuery):
         "• **Задать HWID** — вставьте **64-символьный** hex (как в приложении).\n"
         "• **Реферальный %** — доля с каждой оплаты приглашённого; там же **мин. вывод** реф. баланса.\n"
         "• **Реф. баланс** в карточке пользователя — задать **доступную к выводу** сумму (USD).\n"
-        "• **Описания тарифов** — HTML карточки STANDART/PRO/MAX (цены в тексте); списание в Crypto Pay — .env.\n"
+        "• **Описания тарифов** — HTML карточки STANDART/PRO/MAX/TEAM/UNIQUEIZER (цены в тексте); списание в Crypto Pay — .env.\n"
         "• **Рассылка** — одно сообщение всем из `users` (копирование: текст, фото, документ и т.д.).\n\n"
         "/cancel — отменить ввод.",
         parse_mode="Markdown",
