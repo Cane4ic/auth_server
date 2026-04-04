@@ -229,6 +229,7 @@ class NuAiPreset(NuTelegramBody):
 class AdminStates(StatesGroup):
     """Ожидание ввода от админа"""
     sub_days = State()
+    uniqueizer_sub_days = State()
     hwid_value = State()
     referral_percent = State()
     referral_balance_set = State()
@@ -1701,12 +1702,18 @@ def build_user_card_text(tid: int, u: dict) -> str:
     bal_line = ""
     if abs(bal_adj) > 1e-9:
         bal_line = f"• Корр. реф. вывода: <b>{bal_adj:+.2f}</b> USD\n"
+    uz = _uniqueizer_until_ts(u)
+    uz_ok = uz >= now
+    uz_status = "активен ✅" if uz_ok else "истёк ⛔"
+    uz_disp = fmt_ts(uz) if uz > 0 else "—"
     return (
         f"👤 <b>Пользователь</b>\n\n"
         f"• ID: <code>{tid}</code>\n"
         f"• Username: {un}\n"
-        f"• Подписка: <b>{esc_html(status)}</b>\n"
+        f"• Подписка (приложение): <b>{esc_html(status)}</b>\n"
         f"• До (UTC): {esc_html(fmt_ts(sub))}\n"
+        f"• Уникализатор (бот): <b>{esc_html(uz_status)}</b>\n"
+        f"• Уник. до (UTC): {esc_html(uz_disp)}\n"
         f"• Реф. %: <b>{ref_pct:g}%</b> ({ref_src})\n"
         f"{bal_line}"
         f"• HWID:\n{hw_show}\n"
@@ -1789,6 +1796,17 @@ def kb_user_actions(tid: int):
             ],
             [
                 InlineKeyboardButton(text="✏️ Свой срок (дней)", callback_data=f"{CB}:s:{tid}"),
+            ],
+            [
+                InlineKeyboardButton(text="🎯 +7 Уник.", callback_data=f"{CB}:uzq:{tid}:7"),
+                InlineKeyboardButton(text="🎯 +30", callback_data=f"{CB}:uzq:{tid}:30"),
+                InlineKeyboardButton(text="🎯 +365", callback_data=f"{CB}:uzq:{tid}:365"),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✏️ Уник. свой срок (дней)",
+                    callback_data=f"{CB}:uzs:{tid}",
+                ),
             ],
             [
                 InlineKeyboardButton(text="🗑 Сбросить HWID", callback_data=f"{CB}:h:{tid}"),
@@ -4615,8 +4633,9 @@ async def cb_help(query: CallbackQuery):
     await safe_edit_text(query.message,
         "📖 **Справка**\n\n"
         "• **Пользователи** — список из базы, пагинация.\n"
-        "• **+7 / +30 / +365** — продлить подписку от текущего момента.\n"
-        "• **Свой срок** — введите число **дней** (можно `0` — сразу истекает).\n"
+        "• **+7 / +30 / +365** — подписка приложения от текущего момента.\n"
+        "• **Свой срок** — дни подписки приложения (`0` — сразу истекает).\n"
+        "• **🎯 +7 / +30 / +365** и **Уник. свой срок** — доступ к Уникализатору в боте (то же правило, отдельная колонка).\n"
         "• **Сброс HWID** — пользователь сможет войти с нового ПК.\n"
         "• **Задать HWID** — вставьте **64-символьный** hex (как в приложении).\n"
         "• **Реферальный %** — доля с каждой оплаты приглашённого; там же **мин. вывод** реф. баланса.\n"
@@ -4944,6 +4963,41 @@ async def cb_quick_sub(query: CallbackQuery, state: FSMContext):
     await edit_user_card(query, tid, f"✅ +{days} дн.")
 
 
+@dp.callback_query(F.data.startswith(f"{CB}:uzq:"))
+async def cb_quick_uniqueizer_sub(query: CallbackQuery, state: FSMContext):
+    """Выдача Уникализатора (бот): a:uzq:telegram_id:days — срок от _сейчас_, как a:q: для приложения."""
+    if not is_admin(query.from_user.id):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    parts = query.data.split(":")
+    if len(parts) < 4:
+        await query.answer("Ошибка")
+        return
+    try:
+        tid = int(parts[2])
+        days = int(parts[3])
+    except ValueError:
+        await query.answer("Ошибка данных")
+        return
+
+    until = int(time.time()) + days * 86400
+    u = user_get(tid)
+    if u:
+        supabase.table("users").update({"uniqueizer_until": until}).eq("telegram_id", tid).execute()
+    else:
+        supabase.table("users").insert(
+            {
+                "telegram_id": tid,
+                "subscription_until": 0,
+                "uniqueizer_until": until,
+                "hwid": None,
+            }
+        ).execute()
+
+    await edit_user_card(query, tid, f"✅ Уник. +{days} дн.")
+
+
 @dp.callback_query(F.data.startswith(f"{CB}:s:"))
 async def cb_sub_prompt(query: CallbackQuery, state: FSMContext):
     if not is_admin(query.from_user.id):
@@ -4960,6 +5014,27 @@ async def cb_sub_prompt(query: CallbackQuery, state: FSMContext):
     await query.message.answer(
         f"Введите **количество дней** подписки от _сейчас_ для `{tid}`.\n"
         f"`0` — подписка сразу истекает.\n/cancel — отмена.",
+        parse_mode="Markdown",
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data.startswith(f"{CB}:uzs:"))
+async def cb_uniqueizer_sub_prompt(query: CallbackQuery, state: FSMContext):
+    if not is_admin(query.from_user.id):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    try:
+        tid = int(query.data.split(":")[2])
+    except (IndexError, ValueError):
+        await query.answer("Ошибка ID")
+        return
+
+    await state.set_state(AdminStates.uniqueizer_sub_days)
+    await state.update_data(telegram_id=tid)
+    await query.message.answer(
+        f"Введите **количество дней** доступа к **Уникализатору** (бот) от _сейчас_ для `{tid}`.\n"
+        f"`0` — доступ сразу истекает.\n/cancel — отмена.",
         parse_mode="Markdown",
     )
     await query.answer()
@@ -4996,6 +5071,47 @@ async def process_sub_days(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
         f"✅ Подписка для `{tid}` установлена: **{fmt_ts(until)}** ({days} дн.)",
+        parse_mode="Markdown",
+        reply_markup=kb_main_admin(),
+    )
+
+
+@dp.message(AdminStates.uniqueizer_sub_days, F.text)
+async def process_uniqueizer_sub_days(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    data = await state.get_data()
+    tid = data.get("telegram_id")
+    if not tid:
+        await state.clear()
+        await message.answer("Сессия сброшена. /admin")
+        return
+    try:
+        days = int(message.text.strip())
+        if days < 0:
+            raise ValueError()
+    except ValueError:
+        await message.answer("Нужно целое число дней (≥ 0).")
+        return
+
+    until = int(time.time()) + days * 86400
+    u = user_get(tid)
+    if u:
+        supabase.table("users").update({"uniqueizer_until": until}).eq("telegram_id", tid).execute()
+    else:
+        supabase.table("users").insert(
+            {
+                "telegram_id": tid,
+                "subscription_until": 0,
+                "uniqueizer_until": until,
+                "hwid": None,
+            }
+        ).execute()
+
+    await state.clear()
+    await message.answer(
+        f"✅ Уникализатор для `{tid}` до: **{fmt_ts(until)}** ({days} дн.)",
         parse_mode="Markdown",
         reply_markup=kb_main_admin(),
     )
