@@ -699,13 +699,16 @@ def user_has_active_team_plan(telegram_id: int) -> bool:
 
 
 def user_has_active_uniqueizer_plan(telegram_id: int) -> bool:
-    """Активная подписка с планом Uniqueizer (код u в users.subscription_plan)."""
+    """Доступ к Уникализатору: uniqueizer_until или legacy (plan u + subscription_until)."""
     u = user_get(telegram_id)
     if not u:
         return False
-    if (u.get("subscription_plan") or "").strip().lower() != "u":
-        return False
-    return int(u.get("subscription_until") or 0) >= int(time.time())
+    now = int(time.time())
+    if _uniqueizer_until_ts(u) >= now:
+        return True
+    if (u.get("subscription_plan") or "").strip().lower() == "u":
+        return int(u.get("subscription_until") or 0) >= now
+    return False
 
 
 def team_get_by_owner(owner_telegram_id: int) -> Optional[dict]:
@@ -892,6 +895,40 @@ def _subscription_until_ts(user_row: dict) -> int:
     return 0
 
 
+def _uniqueizer_until_ts(user_row: dict) -> int:
+    """Срок доступа к Уникализатору в боте (колонка users.uniqueizer_until)."""
+    raw = user_row.get("uniqueizer_until")
+    if raw is None:
+        return 0
+    if isinstance(raw, bool):
+        return 0
+    if isinstance(raw, (int, float)):
+        return int(raw)
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return 0
+        try:
+            return int(s)
+        except ValueError:
+            return 0
+    return 0
+
+
+def user_row_has_active_app_subscription(u_row: dict) -> bool:
+    """Подписка на приложение: срок основной подписки и план не UNIQUEIZER (legacy u не даёт вход)."""
+    if _subscription_until_ts(u_row) < int(time.time()):
+        return False
+    if (u_row.get("subscription_plan") or "").strip().lower() == "u":
+        return False
+    return True
+
+
+def user_has_active_app_subscription(telegram_id: int) -> bool:
+    u = user_get(telegram_id)
+    return bool(u and user_row_has_active_app_subscription(u))
+
+
 def team_member_has_active_team_access(member_telegram_id: int) -> bool:
     """Участник в team_members и у владельца команды активна подписка TEAM (plan t, срок не истёк)."""
     try:
@@ -925,13 +962,6 @@ def team_member_has_active_team_access(member_telegram_id: int) -> bool:
     return False
 
 
-def user_direct_subscription_active(telegram_id: int) -> bool:
-    u = user_get(telegram_id)
-    if not u:
-        return False
-    return _subscription_until_ts(u) >= int(time.time())
-
-
 def ensure_user_row_for_login(telegram_id: int, username: str) -> Optional[dict]:
     """Минимальная строка users для HWID; для участника команды без своей подписки."""
     u = user_get(telegram_id)
@@ -957,8 +987,8 @@ def ensure_user_row_for_login(telegram_id: int, username: str) -> Optional[dict]
 
 
 def nu_subscription_allowed(telegram_id: int) -> bool:
-    """Активная личная подписка или место в команде с оплаченным TEAM у владельца."""
-    if user_direct_subscription_active(telegram_id):
+    """Приложение: активная подписка s/p/m/t (не UNIQUEIZER) или место в команде TEAM."""
+    if user_has_active_app_subscription(telegram_id):
         return True
     return team_member_has_active_team_access(telegram_id)
 
@@ -1140,6 +1170,33 @@ def extend_user_subscription_days(
     return until
 
 
+def extend_user_uniqueizer_days(telegram_id: int, days: int) -> int:
+    """Продление только uniqueizer_until; не трогает подписку приложения. Снимает legacy subscription_plan=u."""
+    now = int(time.time())
+    u = user_get(telegram_id)
+    base = now
+    if u:
+        cur = _uniqueizer_until_ts(u)
+        if cur > base:
+            base = cur
+    until = base + max(1, int(days)) * 86400
+    patch: dict = {"uniqueizer_until": until}
+    if u and (u.get("subscription_plan") or "").strip().lower() == "u":
+        patch["subscription_plan"] = None
+    if u:
+        supabase.table("users").update(patch).eq("telegram_id", telegram_id).execute()
+    else:
+        supabase.table("users").insert(
+            {
+                "telegram_id": telegram_id,
+                "subscription_until": 0,
+                "uniqueizer_until": until,
+                "hwid": None,
+            }
+        ).execute()
+    return until
+
+
 def user_eligible_for_renewal_price(telegram_id: int, purchase_plan_code: str) -> bool:
     """Цена продления только если срок истёк и покупают тот же тариф, что был при последней Crypto Pay оплате."""
     u = user_get(telegram_id)
@@ -1154,6 +1211,22 @@ def user_eligible_for_renewal_price(telegram_id: int, purchase_plan_code: str) -
     if not stored:
         return False
     return stored == (purchase_plan_code or "").strip().lower()
+
+
+def user_eligible_for_uniqueizer_renewal_price(telegram_id: int) -> bool:
+    """Цена продления UNIQUEIZER: раньше уже был оплаченный период (колонка или legacy plan u), срок истёк."""
+    u = user_get(telegram_id)
+    if not u:
+        return False
+    now = int(time.time())
+    uz = _uniqueizer_until_ts(u)
+    if uz > 0 and uz < now:
+        return True
+    plan = (u.get("subscription_plan") or "").strip().lower()
+    legacy_sub = int(u.get("subscription_until") or 0)
+    if plan == "u" and legacy_sub > 0 and legacy_sub < now:
+        return True
+    return False
 
 
 def get_referral_percent() -> float:
@@ -1958,20 +2031,36 @@ def build_user_profile_public_text(tid: int, u: Optional[dict]) -> str:
             "Используйте «Купить подписку», если ещё не оформляли доступ."
         )
     now = int(time.time())
-    sub = u.get("subscription_until") or 0
-    active = sub >= now
-    active_word = "активна" if active else "неактивна"
+    sub = int(u.get("subscription_until") or 0)
     plan_code = (u.get("subscription_plan") or "").strip().lower()
-    plan_label = {"s": "STANDART", "p": "PRO", "m": "MAX", "t": "TEAM", "u": "UNIQUEIZER"}.get(
-        plan_code, "—"
-    )
+    app_codes = ("s", "p", "m", "t")
+    app_plan_code = plan_code if plan_code in app_codes else ""
+    if plan_code == "u":
+        app_plan_code = ""
+    app_label = {"s": "STANDART", "p": "PRO", "m": "MAX", "t": "TEAM"}.get(app_plan_code, "—")
+    app_active = bool(app_plan_code) and sub >= now
+    app_word = "активна" if app_active else "не активна"
+
+    uz_col = _uniqueizer_until_ts(u)
+    uz_until = uz_col
+    if plan_code == "u" and sub > uz_until:
+        uz_until = sub
+    uniq_active = uz_until >= now
+    uniq_word = "активен" if uniq_active else "не активен"
+    app_until_disp = fmt_ts(sub) if app_plan_code and sub > 0 else "—"
+    uniq_until_disp = fmt_ts(uz_until) if uz_until > 0 else "—"
+
     username = (u.get("username") or "").strip() or "—"
     return (
         "👤 <b>Профиль</b>\n\n"
         f"Username: <b>{esc_html(username)}</b>\n"
         f"ID: <code>{tid}</code>\n\n"
-        f"Подписка: <b>{esc_html(plan_label)}</b> - <b>{esc_html(active_word)}</b>\n"
-        f"Действительна: <b>{esc_html(fmt_ts(sub))}</b>\n"
+        "<b>Приложение</b>\n"
+        f"Тариф: <b>{esc_html(app_label)}</b> — <b>{esc_html(app_word)}</b>\n"
+        f"До (UTC): <b>{esc_html(app_until_disp)}</b>\n\n"
+        "<b>Уникализатор</b> (бот)\n"
+        f"Доступ: <b>{esc_html(uniq_word)}</b>\n"
+        f"До (UTC): <b>{esc_html(uniq_until_disp)}</b>\n"
     )
 
 
@@ -2156,69 +2245,85 @@ async def crypto_pay_webhook(request: Request):
         )
 
     days = subscription_days_for_plan(plan_code)
-    until = extend_user_subscription_days(telegram_id, days, plan_code=plan_code)
+    if plan_code == "u":
+        until = extend_user_uniqueizer_days(telegram_id, days)
+    else:
+        until = extend_user_subscription_days(telegram_id, days, plan_code=plan_code)
 
     await referral_process_paid_invoice(inv, telegram_id, is_renewal_price)
 
     if bot:
         try:
-            await bot.send_message(
-                chat_id=telegram_id,
-                text=(
-                    "✅ **Оплата получена** — подписка активирована.\n\n"
-                    f"Доступ до: `{fmt_ts(until)}`\n\n"
-                    "Можно входить в приложение с этого Telegram-аккаунта."
-                ),
-                parse_mode="Markdown",
-            )
+            if plan_code == "u":
+                await bot.send_message(
+                    chat_id=telegram_id,
+                    text=(
+                        "✅ **Оплата получена** — доступ к **Уникализатору** в боте активирован.\n\n"
+                        f"До: `{fmt_ts(until)}`\n\n"
+                        "Это не подписка на приложение: для входа в программу оформите тариф "
+                        "STANDART / PRO / MAX или TEAM."
+                    ),
+                    parse_mode="Markdown",
+                )
+            else:
+                await bot.send_message(
+                    chat_id=telegram_id,
+                    text=(
+                        "✅ **Оплата получена** — подписка активирована.\n\n"
+                        f"Доступ до: `{fmt_ts(until)}`\n\n"
+                        "Можно входить в приложение с этого Telegram-аккаунта."
+                    ),
+                    parse_mode="Markdown",
+                )
         except Exception as e:
             print(f"crypto pay: уведомление пользователю {telegram_id}: {e}")
 
-        # Выдача файлов после оплаты
-        try:
-            zip_file_id = get_app_zip_file_id()
-            txt_file_id = get_app_txt_file_id()
+        if plan_code != "u":
+            # Выдача файлов после оплаты подписки на приложение
+            try:
+                zip_file_id = get_app_zip_file_id()
+                txt_file_id = get_app_txt_file_id()
 
-            sent_any = False
-            if zip_file_id or txt_file_id:
-                if zip_file_id:
-                    await bot.send_document(
-                        chat_id=telegram_id,
-                        document=zip_file_id,
-                    )
-                    sent_any = True
-                if txt_file_id:
-                    await bot.send_document(
-                        chat_id=telegram_id,
-                        document=txt_file_id,
-                    )
-                    sent_any = True
+                sent_any = False
+                if zip_file_id or txt_file_id:
+                    if zip_file_id:
+                        await bot.send_document(
+                            chat_id=telegram_id,
+                            document=zip_file_id,
+                        )
+                        sent_any = True
+                    if txt_file_id:
+                        await bot.send_document(
+                            chat_id=telegram_id,
+                            document=txt_file_id,
+                        )
+                        sent_any = True
 
-            # Fallback: отправка с диска (если file_id не задан или отсутствует)
-            if not sent_any:
-                await ensure_app_files_downloaded()
-                zip_p = _resolve_local_file_path(APP_ZIP_PATH)
-                txt_p = _resolve_local_file_path(APP_TXT_PATH)
-                if os.path.isfile(zip_p):
-                    await bot.send_document(
-                        chat_id=telegram_id,
-                        document=FSInputFile(zip_p, filename=os.path.basename(zip_p)),
-                    )
-                    sent_any = True
-                if os.path.isfile(txt_p):
-                    await bot.send_document(
-                        chat_id=telegram_id,
-                        document=FSInputFile(txt_p, filename=os.path.basename(txt_p)),
-                    )
-                    sent_any = True
+                # Fallback: отправка с диска (если file_id не задан или отсутствует)
+                if not sent_any:
+                    await ensure_app_files_downloaded()
+                    zip_p = _resolve_local_file_path(APP_ZIP_PATH)
+                    txt_p = _resolve_local_file_path(APP_TXT_PATH)
+                    if os.path.isfile(zip_p):
+                        await bot.send_document(
+                            chat_id=telegram_id,
+                            document=FSInputFile(zip_p, filename=os.path.basename(zip_p)),
+                        )
+                        sent_any = True
+                    if os.path.isfile(txt_p):
+                        await bot.send_document(
+                            chat_id=telegram_id,
+                            document=FSInputFile(txt_p, filename=os.path.basename(txt_p)),
+                        )
+                        sent_any = True
 
-            if not sent_any:
-                await bot.send_message(
-                    chat_id=telegram_id,
-                    text="Файлы для скачивания не найдены. Установите APP_ZIP_FILE_ID/APP_TXT_FILE_ID или разместите файлы на сервере.",
-                )
-        except Exception as e:
-            print(f"crypto pay: send app files failed for {telegram_id}: {e}")
+                if not sent_any:
+                    await bot.send_message(
+                        chat_id=telegram_id,
+                        text="Файлы для скачивания не найдены. Установите APP_ZIP_FILE_ID/APP_TXT_FILE_ID или разместите файлы на сервере.",
+                    )
+            except Exception as e:
+                print(f"crypto pay: send app files failed for {telegram_id}: {e}")
 
     return PlainTextResponse("OK", status_code=200)
 
@@ -2282,14 +2387,17 @@ async def verify_subscription(telegram_id: int):
     if user_res.data:
         u = user_res.data[0]
         if _subscription_until_ts(u) >= current_time:
-            plan = u.get("subscription_plan") or "m"
-            if isinstance(plan, str):
-                plan = plan.strip().lower()
+            raw_plan = u.get("subscription_plan")
+            if isinstance(raw_plan, str):
+                plan_norm = raw_plan.strip().lower()
             else:
-                plan = "m"
-            if plan not in ("s", "p", "m", "t", "u"):
-                plan = "m"
-            return {"status": "success", "message": "Subscription active", "subscription_plan": plan}
+                plan_norm = "m"
+            if plan_norm == "u":
+                pass
+            elif plan_norm in ("s", "p", "m", "t"):
+                return {"status": "success", "message": "Subscription active", "subscription_plan": plan_norm}
+            else:
+                return {"status": "success", "message": "Subscription active", "subscription_plan": "m"}
     if team_member_has_active_team_access(telegram_id):
         # Лимиты как у MAX: отдельную подписку покупать не нужно
         return {
@@ -2963,7 +3071,7 @@ async def cmd_start(message: Message):
     user_res = supabase.table("users").select("*").eq("telegram_id", telegram_id).execute()
     current_time = int(time.time())
     u_row = user_res.data[0] if user_res.data else None
-    direct_ok = u_row is not None and _subscription_until_ts(u_row) >= current_time
+    direct_ok = u_row is not None and user_row_has_active_app_subscription(u_row)
     team_ok = team_member_has_active_team_access(telegram_id)
 
     if not direct_ok and not team_ok:
@@ -3414,8 +3522,9 @@ _TARIFF_PLAN_DEFAULT = {
     ),
     "u": (
         "<b>UNIQUEIZER</b>\n\n"
-        "Тариф <b>Уникализатор</b>: доступ к разделу <b>«Уникализатор»</b> в главном меню бота.\n\n"
-        "Цены списания: <code>CRYPTO_PAY_AMOUNT_UNIQUEIZER</code> / продление "
+        "Доступ только в <b>Telegram-боте</b> (раздел <b>«Уникализатор»</b>), "
+        "срок хранится в <code>users.uniqueizer_until</code> — <b>не</b> даёт вход в приложение.\n\n"
+        "Суммы: <code>CRYPTO_PAY_AMOUNT_UNIQUEIZER</code> / продление "
         "<code>CRYPTO_PAY_RENEW_AMOUNT_UNIQUEIZER</code> в .env."
     ),
 }
@@ -3547,7 +3656,10 @@ async def cb_user_tariff_plan(query: CallbackQuery):
         return
     sub_text = tariff_plan_body_html(code)
     uid = query.from_user.id
-    if user_eligible_for_renewal_price(uid, code):
+    if code == "u":
+        if user_eligible_for_uniqueizer_renewal_price(uid):
+            sub_text += "\n\n<i>По «Купить» — цена продления (Уникализатор).</i>"
+    elif user_eligible_for_renewal_price(uid, code):
         sub_text += "\n\n<i>По «Купить» — цена продления (тот же тариф).</i>"
     else:
         u = user_get(uid)
@@ -3608,7 +3720,11 @@ async def cb_tariff_buy_crypto_pay(query: CallbackQuery):
         return
     tid = query.from_user.id
     label = tariff_plan_invoice_label(code)
-    renewal = user_eligible_for_renewal_price(tid, code)
+    renewal = (
+        user_eligible_for_uniqueizer_renewal_price(tid)
+        if code == "u"
+        else user_eligible_for_renewal_price(tid, code)
+    )
     amount = crypto_pay_amount_for_plan(code, renewal=renewal)
     asset = CRYPTO_PAY_ASSET
     desc = (
