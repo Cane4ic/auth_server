@@ -185,6 +185,7 @@ EMOJI_TARIFF_STANDART = "6240274919138008144"
 EMOJI_TARIFF_PRO = "6239929887235251301"
 EMOJI_TARIFF_TEAM = "6239986121242057870"
 EMOJI_BTN_BACK = "6240235439798624471"
+EMOJI_BTN_TEAM = "6242155895770324279"
 # Заголовки блоков в экране «Профиль» (подпись к tg-emoji)
 EMOJI_PROFILE_SECTION = "6240132665526197098"
 EMOJI_PROFILE_APPLICATION = "6239798869257887565"
@@ -768,14 +769,52 @@ def user_get(tid: int):
         return None
 
 
+def _user_plan_code_lower(u: Optional[dict]) -> str:
+    if not u:
+        return ""
+    return (u.get("subscription_plan") or "").strip().lower()
+
+
+# Планы TEAM: legacy «t» (докупка мест) и фикс-пакеты t10…t100
+TEAM_TIER_CODES = frozenset({"t", "t10", "t25", "t50", "t100"})
+TEAM_FIXED_TIER_CODES = frozenset({"t10", "t25", "t50", "t100"})
+TEAM_TIER_SEAT_CAP: dict[str, int] = {
+    "t": 10,
+    "t10": 10,
+    "t25": 25,
+    "t50": 50,
+    "t100": 100,
+}
+# Суммы Crypto Pay (USDT и т.п.): покупка / продление
+TEAM_FIXED_CRYPTO_AMOUNTS: dict[str, tuple[str, str]] = {
+    "t10": ("200", "165"),
+    "t25": ("350", "285"),
+    "t50": ("600", "525"),
+    "t100": ("1100", "925"),
+}
+
+
 def user_has_active_team_plan(telegram_id: int) -> bool:
-    """Активная подписка с планом TEAM (код t в users.subscription_plan)."""
+    """Владелец команды: TEAM (t / t10…), либо MAX (m) с одним бесплатным местом."""
     u = user_get(telegram_id)
     if not u:
         return False
-    if (u.get("subscription_plan") or "").strip().lower() != "t":
+    if _subscription_until_ts(u) < int(time.time()):
         return False
-    return int(u.get("subscription_until") or 0) >= int(time.time())
+    p = _user_plan_code_lower(u)
+    if p in TEAM_TIER_CODES:
+        return True
+    if p == "m":
+        return True
+    return False
+
+
+def user_may_purchase_team_seat_bundle(telegram_id: int) -> bool:
+    """Старый счёт nu_kind=team_bundle — только legacy-план «t», не MAX и не фикс-пакеты."""
+    u = user_get(telegram_id)
+    if not u:
+        return False
+    return _user_plan_code_lower(u) == "t"
 
 
 def user_has_active_uniqueizer_plan(telegram_id: int) -> bool:
@@ -1584,6 +1623,8 @@ def team_create_for_owner(owner_telegram_id: int, name: str) -> Optional[str]:
 def team_add_seats_paid(team_id: str, owner_telegram_id: int, seats: int) -> bool:
     if seats < 1 or seats > 100:
         return False
+    if not user_may_purchase_team_seat_bundle(owner_telegram_id):
+        return False
     t = team_get_by_owner(owner_telegram_id)
     if not t or str(t.get("id")) != str(team_id):
         return False
@@ -1617,6 +1658,67 @@ def team_members_count(team_id: str) -> int:
     return len(team_members_list(team_id))
 
 
+def team_member_slots_total(team: dict, owner_telegram_id: int) -> int:
+    """Сколько участников можно иметь (лимит слотов) с учётом тарифа владельца."""
+    u = user_get(owner_telegram_id)
+    p = _user_plan_code_lower(u) if u else ""
+    if p == "m":
+        return 1
+    cap_plan = TEAM_TIER_SEAT_CAP.get(p)
+    bought = int(team.get("seats_purchased") or 0)
+    raw_cap = team.get("seat_cap")
+    if raw_cap is not None:
+        try:
+            c = int(raw_cap)
+            if c > 0:
+                return min(c, bought) if bought > 0 else c
+        except (TypeError, ValueError):
+            pass
+    if cap_plan is not None:
+        return min(cap_plan, bought) if bought > 0 else cap_plan
+    return max(0, bought)
+
+
+def team_update_seats_and_cap(
+    owner_telegram_id: int, seats_purchased: int, seat_cap: int
+) -> bool:
+    t = team_get_by_owner(owner_telegram_id)
+    if not t:
+        return False
+    try:
+        supabase.table("teams").update(
+            {"seats_purchased": seats_purchased, "seat_cap": seat_cap}
+        ).eq("id", str(t["id"])).eq("owner_telegram_id", owner_telegram_id).execute()
+        return True
+    except Exception as e:
+        print(f"teams update seats/cap failed: {e}")
+        return False
+
+
+def team_apply_fixed_tier_after_payment(telegram_id: int, plan_code: str) -> None:
+    """После оплаты t10/t25/t50/t100: выдать слоты пакета (создать команду при необходимости)."""
+    cap = TEAM_TIER_SEAT_CAP.get(plan_code)
+    if cap is None or plan_code not in TEAM_FIXED_TIER_CODES:
+        return
+    team = team_get_by_owner(telegram_id)
+    now = int(time.time())
+    if not team:
+        try:
+            supabase.table("teams").insert(
+                {
+                    "owner_telegram_id": telegram_id,
+                    "name": "Команда",
+                    "seats_purchased": cap,
+                    "seat_cap": cap,
+                    "created_at": now,
+                }
+            ).execute()
+        except Exception as e:
+            print(f"team_apply_fixed_tier insert {telegram_id}: {e}")
+        return
+    team_update_seats_and_cap(telegram_id, cap, cap)
+
+
 def team_member_display_line(member_telegram_id: int) -> str:
     u = user_get(member_telegram_id)
     un = ""
@@ -1630,7 +1732,7 @@ def team_member_display_line(member_telegram_id: int) -> str:
 
 
 def format_team_dashboard_html(team: dict, owner_telegram_id: int) -> str:
-    seats = int(team.get("seats_purchased") or 0)
+    slots = team_member_slots_total(team, owner_telegram_id)
     tid = str(team["id"])
     members = team_members_list(tid)
     n_mem = len(members)
@@ -1639,8 +1741,8 @@ def format_team_dashboard_html(team: dict, owner_telegram_id: int) -> str:
         "👥 <b>Команда</b>",
         "",
         f"Название: <b>{name}</b>",
-        f"Оплачено мест: <b>{seats}</b>",
-        f"Участников в списке: <b>{n_mem}</b> из <b>{seats}</b>",
+        f"Доступно слотов: <b>{slots}</b>",
+        f"Участников в списке: <b>{n_mem}</b> из <b>{slots}</b>",
         "",
     ]
     if members:
@@ -1758,7 +1860,7 @@ def user_has_active_app_subscription(telegram_id: int) -> bool:
 
 
 def team_member_has_active_team_access(member_telegram_id: int) -> bool:
-    """Участник в team_members и у владельца команды активна подписка TEAM (plan t, срок не истёк)."""
+    """Участник в team_members и у владельца активна подписка TEAM/пакет или MAX (команда)."""
     try:
         r = (
             supabase.table("team_members")
@@ -2611,7 +2713,11 @@ def kb_admin_tariff_plans():
             [InlineKeyboardButton(text="STANDART", callback_data=f"{CB}:tpe:s")],
             [InlineKeyboardButton(text="PRO", callback_data=f"{CB}:tpe:p")],
             [InlineKeyboardButton(text="MAX", callback_data=f"{CB}:tpe:m")],
-            [InlineKeyboardButton(text="TEAM", callback_data=f"{CB}:tpe:t")],
+            [InlineKeyboardButton(text="TEAM (legacy t)", callback_data=f"{CB}:tpe:t")],
+            [InlineKeyboardButton(text="TEAM 10", callback_data=f"{CB}:tpe:t10")],
+            [InlineKeyboardButton(text="TEAM PLUS 25", callback_data=f"{CB}:tpe:t25")],
+            [InlineKeyboardButton(text="TEAM PRO 50", callback_data=f"{CB}:tpe:t50")],
+            [InlineKeyboardButton(text="TEAM MAX 100", callback_data=f"{CB}:tpe:t100")],
             [InlineKeyboardButton(text="UNIQUEIZER", callback_data=f"{CB}:tpe:u")],
             [InlineKeyboardButton(text="⬅️ Админ-меню", callback_data=f"{CB}:menu")],
         ]
@@ -2760,9 +2866,9 @@ def kb_user_main_menu(telegram_user_id: Optional[int] = None):
         rows.append(
             [_btn_uz_icon("Уникализатор", f"{UCB}:uniqueizer", EMOJI_BTN_UNIQUEIZER)]
         )
-    if telegram_user_id is not None and user_has_active_team_plan(telegram_user_id):
+    if telegram_user_id is not None:
         rows.append(
-            [InlineKeyboardButton(text="👥 Команда", callback_data=f"{UCB}:team")]
+            [_btn_uz_icon("Команда", f"{UCB}:team", EMOJI_BTN_TEAM)]
         )
     rows.append([support_btn])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -2835,19 +2941,57 @@ def kb_tariffs():
             [_btn_uz_icon("STANDART", f"{UCB}:tariff:s", EMOJI_TARIFF_STANDART)],
             [_btn_uz_icon("PRO", f"{UCB}:tariff:p", EMOJI_TARIFF_PRO)],
             [_btn_uz_icon("MAX", f"{UCB}:tariff:m", EMOJI_TARIFF_MAX)],
-            [_btn_uz_icon("TEAM", f"{UCB}:tariff:t", EMOJI_TARIFF_TEAM)],
+            [_btn_uz_icon("TEAM", f"{UCB}:tteam", EMOJI_TARIFF_TEAM)],
             [InlineKeyboardButton(text="UNIQUEIZER", callback_data=f"{UCB}:tariff:u")],
             [_btn_uz_back("Главное меню", f"{UCB}:main")],
         ]
     )
 
 
+def kb_tariff_team_pick() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="TEAM — до 10", callback_data=f"{UCB}:tariff:t10")],
+            [InlineKeyboardButton(text="TEAM PLUS — до 25", callback_data=f"{UCB}:tariff:t25")],
+            [InlineKeyboardButton(text="TEAM PRO — до 50", callback_data=f"{UCB}:tariff:t50")],
+            [InlineKeyboardButton(text="TEAM MAX — до 100", callback_data=f"{UCB}:tariff:t100")],
+            [_btn_uz_back("К тарифам", f"{UCB}:tariffs_menu")],
+            [_btn_uz_back("Главное меню", f"{UCB}:main")],
+        ]
+    )
+
+
+def text_tariff_team_menu_html() -> str:
+    return (
+        "<b>Командные тарифы</b>\n\n"
+        "Выберите пакет — сумма в Crypto Pay фиксированная.\n\n"
+        "• <b>TEAM</b> — до <b>10</b> — <b>200 $</b> / продление <b>165 $</b>\n"
+        "• <b>TEAM PLUS</b> — до <b>25</b> — <b>350 $</b> / <b>285 $</b>\n"
+        "• <b>TEAM PRO</b> — до <b>50</b> — <b>600 $</b> / <b>525 $</b>\n"
+        "• <b>TEAM MAX</b> — до <b>100</b> — <b>1100 $</b> / <b>925 $</b>\n\n"
+        "<i>В цену уже заложено: 100 $ база + 10 $ за каждое место в пакете.</i>"
+    )
+
+
+async def show_tariff_team_pick_screen(query: CallbackQuery) -> None:
+    await safe_edit_text(
+        query.message,
+        text_tariff_team_menu_html(),
+        parse_mode="HTML",
+        reply_markup=kb_tariff_team_pick(),
+    )
+
+
 def kb_tariff_subplan_detail(code: str) -> InlineKeyboardMarkup:
     """Экран описания тарифа: купить, назад к списку, главное меню."""
+    back_list = (
+        f"{UCB}:tteam" if code in TEAM_FIXED_TIER_CODES else f"{UCB}:tariffs_menu"
+    )
+    back_label = "К выбору TEAM" if code in TEAM_FIXED_TIER_CODES else "К тарифам"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="💳 Купить", callback_data=f"{UCB}:tbuy:{code}")],
-            [_btn_uz_back("К тарифам", f"{UCB}:tariffs_menu")],
+            [_btn_uz_back(back_label, back_list)],
             [_btn_uz_back("Главное меню", f"{UCB}:main")],
         ]
     )
@@ -2881,24 +3025,27 @@ def kb_team_setup_cancel() -> InlineKeyboardMarkup:
     )
 
 
-def kb_team_dashboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+def kb_team_dashboard(telegram_user_id: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if user_may_purchase_team_seat_bundle(telegram_user_id):
+        rows.append(
             [
                 InlineKeyboardButton(
                     text="➕ Добавить участников (оплата)",
                     callback_data=f"{UCB}:team_buy_seats",
                 )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="👤 Добавить по Telegram ID",
-                    callback_data=f"{UCB}:team_add_member",
-                )
-            ],
-            [_btn_uz_back("Главное меню", f"{UCB}:main")],
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="👤 Добавить по Telegram ID",
+                callback_data=f"{UCB}:team_add_member",
+            )
         ]
     )
+    rows.append([_btn_uz_back("Главное меню", f"{UCB}:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def text_user_main_menu() -> str:
@@ -2919,11 +3066,21 @@ def build_user_profile_public_text(tid: int, u: Optional[dict]) -> str:
     now = int(time.time())
     sub = int(u.get("subscription_until") or 0)
     plan_code = (u.get("subscription_plan") or "").strip().lower()
-    app_codes = ("s", "p", "m", "t")
+    app_codes = ("s", "p", "m", "t", "t10", "t25", "t50", "t100")
     app_plan_code = plan_code if plan_code in app_codes else ""
     if plan_code == "u":
         app_plan_code = ""
-    app_label = {"s": "STANDART", "p": "PRO", "m": "MAX", "t": "TEAM"}.get(app_plan_code, "—")
+    _app_labels = {
+        "s": "STANDART",
+        "p": "PRO",
+        "m": "MAX",
+        "t": "TEAM",
+        "t10": "TEAM (10)",
+        "t25": "TEAM PLUS",
+        "t50": "TEAM PRO",
+        "t100": "TEAM MAX",
+    }
+    app_label = _app_labels.get(app_plan_code, "—")
     app_active = bool(app_plan_code) and sub >= now
     app_word = "активна" if app_active else "не активна"
 
@@ -3149,6 +3306,8 @@ async def crypto_pay_webhook(request: Request):
         until = extend_user_uniqueizer_days(telegram_id, days)
     else:
         until = extend_user_subscription_days(telegram_id, days, plan_code=plan_code)
+        if plan_code in TEAM_FIXED_TIER_CODES:
+            team_apply_fixed_tier_after_payment(telegram_id, plan_code)
 
     await referral_process_paid_invoice(inv, telegram_id, is_renewal_price)
 
@@ -3294,8 +3453,9 @@ async def verify_subscription(telegram_id: int):
                 plan_norm = "m"
             if plan_norm == "u":
                 pass
-            elif plan_norm in ("s", "p", "m", "t"):
-                return {"status": "success", "message": "Subscription active", "subscription_plan": plan_norm}
+            elif plan_norm in ("s", "p", "m", "t", "t10", "t25", "t50", "t100"):
+                api_plan = "t" if plan_norm in TEAM_FIXED_TIER_CODES else plan_norm
+                return {"status": "success", "message": "Subscription active", "subscription_plan": api_plan}
             else:
                 return {"status": "success", "message": "Subscription active", "subscription_plan": "m"}
     if team_member_has_active_team_access(telegram_id):
@@ -3481,16 +3641,17 @@ _TARIFF_PLAN_IMAGE_URL_KEYS: dict[str, tuple[str, ...]] = {
 
 def tariff_plan_photo_for_plan(code: str) -> Optional[object]:
     """Для карточки тарифа s|p|m|t|u: FSInputFile или URL. None — только текст (как раньше)."""
-    if code not in _TARIFF_PLAN_IMAGE_PATH_KEYS:
+    img_code = "t" if code in TEAM_FIXED_TIER_CODES else code
+    if img_code not in _TARIFF_PLAN_IMAGE_PATH_KEYS:
         return None
-    for ek in _TARIFF_PLAN_IMAGE_PATH_KEYS[code]:
+    for ek in _TARIFF_PLAN_IMAGE_PATH_KEYS[img_code]:
         raw = (os.environ.get(ek) or "").strip()
         if not raw:
             continue
         p = raw if os.path.isabs(raw) else os.path.join(os.path.dirname(os.path.abspath(__file__)), raw)
         if os.path.isfile(p):
             return FSInputFile(p)
-    for ek in _TARIFF_PLAN_IMAGE_URL_KEYS[code]:
+    for ek in _TARIFF_PLAN_IMAGE_URL_KEYS[img_code]:
         raw = (os.environ.get(ek) or "").strip()
         if raw:
             return raw
@@ -4146,18 +4307,28 @@ async def cb_user_team_menu(query: CallbackQuery, state: FSMContext):
     if not await require_policies_or_block(query):
         return
     uid = query.from_user.id
-    if not user_has_active_team_plan(uid):
-        await query.answer("Доступно только при активной подписке TEAM.", show_alert=True)
-        return
     await state.clear()
+    if not user_has_active_team_plan(uid):
+        await safe_edit_text(
+            query.message,
+            "👥 <b>Команда</b>\n\n"
+            "Раздел доступен с тарифом <b>MAX</b> (одно бесплатное место для участника, без докупки) "
+            "или с платным пакетом <b>TEAM</b> в разделе <b>Тарифы</b>.\n\n"
+            "Оформите подходящую подписку и откройте «Команда» снова.",
+            parse_mode="HTML",
+            reply_markup=kb_user_back_main(),
+        )
+        await query.answer()
+        return
     team = team_get_by_owner(uid)
-    if team and int(team.get("seats_purchased") or 0) > 0:
+    slots = team_member_slots_total(team, uid) if team else 0
+    if team and slots > 0:
         text = format_team_dashboard_html(team, uid)
         await safe_edit_text(
             query.message,
             text,
             parse_mode="HTML",
-            reply_markup=kb_team_dashboard(),
+            reply_markup=kb_team_dashboard(uid),
         )
         await query.answer()
         return
@@ -4173,16 +4344,28 @@ async def cb_user_team_menu(query: CallbackQuery, state: FSMContext):
         )
         await query.answer()
         return
-    await state.set_state(UserTeamStates.seats_count)
+    if user_may_purchase_team_seat_bundle(uid):
+        await state.set_state(UserTeamStates.seats_count)
+        await safe_edit_text(
+            query.message,
+            "👥 <b>Создание команды</b>\n\n"
+            f"Команда: <b>{esc_html(str(team.get('name') or '—'))}</b>\n\n"
+            "Введите <b>количество участников</b> целым числом от <b>1</b> до <b>100</b>.\n"
+            f"Стоимость: <b>{TEAM_SEAT_PRICE_USD:g} USD</b> за каждого — оплата одним счётом в Crypto Bot.\n\n"
+            "/cancel — прервать.",
+            parse_mode="HTML",
+            reply_markup=kb_team_setup_cancel(),
+        )
+        await query.answer()
+        return
     await safe_edit_text(
         query.message,
-        "👥 <b>Создание команды</b>\n\n"
-        f"Команда: <b>{esc_html(str(team.get('name') or '—'))}</b>\n\n"
-        "Введите <b>количество участников</b> целым числом от <b>1</b> до <b>100</b>.\n"
-        f"Стоимость: <b>{TEAM_SEAT_PRICE_USD:g} USD</b> за каждого — оплата одним счётом в Crypto Bot.\n\n"
-        "/cancel — прервать.",
+        "👥 <b>Команда</b>\n\n"
+        "Команда создана, но слоты ещё не активированы. Оплатите пакет "
+        "<b>TEAM / TEAM PLUS / TEAM PRO / TEAM MAX</b> в разделе <b>Тарифы</b> — "
+        "после оплаты места начислятся автоматически.",
         parse_mode="HTML",
-        reply_markup=kb_team_setup_cancel(),
+        reply_markup=kb_user_back_main(),
     )
     await query.answer()
 
@@ -4843,11 +5026,14 @@ async def cb_team_buy_seats(query: CallbackQuery, state: FSMContext):
     if not await require_policies_or_block(query):
         return
     uid = query.from_user.id
+    if not user_may_purchase_team_seat_bundle(uid):
+        await query.answer("Докупка мест недоступна для вашего тарифа.", show_alert=True)
+        return
     if not user_has_active_team_plan(uid):
-        await query.answer("Доступно только при активной подписке TEAM.", show_alert=True)
+        await query.answer("Нет доступа к команде.", show_alert=True)
         return
     team = team_get_by_owner(uid)
-    if not team or int(team.get("seats_purchased") or 0) < 1:
+    if not team or team_member_slots_total(team, uid) < 1:
         await query.answer("Сначала завершите создание команды и первую оплату.", show_alert=True)
         return
     await state.set_state(UserTeamStates.add_seats_count)
@@ -4873,23 +5059,25 @@ async def cb_team_add_member(query: CallbackQuery, state: FSMContext):
         await query.answer("Доступно только при активной подписке TEAM.", show_alert=True)
         return
     team = team_get_by_owner(uid)
-    if not team or int(team.get("seats_purchased") or 0) < 1:
+    slots = team_member_slots_total(team, uid) if team else 0
+    if not team or slots < 1:
         await query.answer("Сначала завершите создание команды и оплату мест.", show_alert=True)
         return
     team_id = str(team["id"])
-    seats = int(team.get("seats_purchased") or 0)
-    if team_members_count(team_id) >= seats:
-        await query.answer(
-            "Нет свободных мест. Нажмите «Добавить участников (оплата)» и оплатите слоты.",
-            show_alert=True,
+    if team_members_count(team_id) >= slots:
+        hint = (
+            " Докупка недоступна."
+            if not user_may_purchase_team_seat_bundle(uid)
+            else " Оформите дополнительные места."
         )
+        await query.answer("Нет свободных мест." + hint, show_alert=True)
         return
     await state.set_state(UserTeamStates.add_member_id)
-    free = seats - team_members_count(team_id)
+    free = slots - team_members_count(team_id)
     await safe_edit_text(
         query.message,
         "👤 <b>Добавление участника</b>\n\n"
-        f"Свободных слотов: <b>{free}</b> из <b>{seats}</b>.\n\n"
+        f"Свободных слотов: <b>{free}</b> из <b>{slots}</b>.\n\n"
         "Отправьте <b>числовой Telegram User ID</b> участника (узнать можно у @userinfobot и подобных).\n"
         "Можно несколько ID в одном сообщении через пробел или запятую.\n\n"
         "/cancel — прервать.",
@@ -4981,6 +5169,10 @@ _TARIFF_PLAN_ENV = {
     "p": "TEXT_PLAN_PRO",
     "m": "TEXT_PLAN_MAX",
     "t": "TEXT_PLAN_TEAM",
+    "t10": "TEXT_PLAN_TEAM_10",
+    "t25": "TEXT_PLAN_TEAM_25",
+    "t50": "TEXT_PLAN_TEAM_50",
+    "t100": "TEXT_PLAN_TEAM_100",
     "u": "TEXT_PLAN_UNIQUEIZER",
 }
 # app_settings: полный HTML карточки тарифа (приоритет над TEXT_PLAN_* и _TARIFF_PLAN_DEFAULT).
@@ -4989,6 +5181,10 @@ _TARIFF_PLAN_SETTINGS_KEYS = {
     "p": "tariff_plan_html_p",
     "m": "tariff_plan_html_m",
     "t": "tariff_plan_html_t",
+    "t10": "tariff_plan_html_t10",
+    "t25": "tariff_plan_html_t25",
+    "t50": "tariff_plan_html_t50",
+    "t100": "tariff_plan_html_t100",
     "u": "tariff_plan_html_u",
 }
 _TARIFF_PLAN_DEFAULT = {
@@ -5041,6 +5237,31 @@ _TARIFF_PLAN_DEFAULT = {
         "Суммы: <code>CRYPTO_PAY_AMOUNT_UNIQUEIZER</code> / продление "
         "<code>CRYPTO_PAY_RENEW_AMOUNT_UNIQUEIZER</code> в .env."
     ),
+    "t10": (
+        "<b>TEAM</b> — до <b>10</b> участников\n\n"
+        "• Покупка — <b>200 $</b>\n"
+        "• Продление — <b>165 $</b>\n\n"
+        "Командный доступ в боте (<b>Команда</b>), вход в приложение для владельца и участников по слотам.\n"
+        "Докупка мест отдельно не предусмотрена — фиксированный пакет."
+    ),
+    "t25": (
+        "<b>TEAM PLUS</b> — до <b>25</b> участников\n\n"
+        "• Покупка — <b>350 $</b>\n"
+        "• Продление — <b>285 $</b>\n\n"
+        "Командный доступ в боте, слоты по пакету. Докупка мест отдельно не предусмотрена."
+    ),
+    "t50": (
+        "<b>TEAM PRO</b> — до <b>50</b> участников\n\n"
+        "• Покупка — <b>600 $</b>\n"
+        "• Продление — <b>525 $</b>\n\n"
+        "Командный доступ в боте, слоты по пакету. Докупка мест отдельно не предусмотрена."
+    ),
+    "t100": (
+        "<b>TEAM MAX</b> (команда) — до <b>100</b> участников\n\n"
+        "• Покупка — <b>1100 $</b>\n"
+        "• Продление — <b>925 $</b>\n\n"
+        "Командный доступ в боте, слоты по пакету. Докупка мест отдельно не предусмотрена."
+    ),
 }
 
 
@@ -5056,25 +5277,63 @@ def tariff_plan_body_html(code: str) -> str:
     return (os.environ.get(env_key) or "").strip() or _TARIFF_PLAN_DEFAULT[code]
 
 
-_PLAN_INVOICE_LABEL = {"s": "STANDART", "p": "PRO", "m": "MAX", "t": "TEAM", "u": "UNIQUEIZER"}
+_PLAN_INVOICE_LABEL = {
+    "s": "STANDART",
+    "p": "PRO",
+    "m": "MAX",
+    "t": "TEAM",
+    "t10": "TEAM 10",
+    "t25": "TEAM PLUS",
+    "t50": "TEAM PRO",
+    "t100": "TEAM MAX",
+    "u": "UNIQUEIZER",
+}
 # Имена без суффикса _P (в Railway «сырой» ввод переменных ломает строки вроде ..._P=...).
 _PLAN_AMOUNT_ENV_KEYS = {
     "s": ("CRYPTO_PAY_AMOUNT_STANDART", "CRYPTO_PAY_AMOUNT_S"),
     "p": ("CRYPTO_PAY_AMOUNT_PRO", "CRYPTO_PAY_AMOUNT_P"),
     "m": ("CRYPTO_PAY_AMOUNT_MAX", "CRYPTO_PAY_AMOUNT_M"),
     "t": ("CRYPTO_PAY_AMOUNT_TEAM", "CRYPTO_PAY_AMOUNT_T"),
+    "t10": ("CRYPTO_PAY_AMOUNT_TEAM_10", "CRYPTO_PAY_AMOUNT_T10"),
+    "t25": ("CRYPTO_PAY_AMOUNT_TEAM_25", "CRYPTO_PAY_AMOUNT_T25"),
+    "t50": ("CRYPTO_PAY_AMOUNT_TEAM_50", "CRYPTO_PAY_AMOUNT_T50"),
+    "t100": ("CRYPTO_PAY_AMOUNT_TEAM_100", "CRYPTO_PAY_AMOUNT_T100"),
     "u": ("CRYPTO_PAY_AMOUNT_UNIQUEIZER", "CRYPTO_PAY_AMOUNT_U"),
 }
-_PLAN_AMOUNT_DEFAULT = {"s": "0.1", "p": "0.15", "m": "0.2", "t": "0.25", "u": "0.26"}
+_PLAN_AMOUNT_DEFAULT = {
+    "s": "0.1",
+    "p": "0.15",
+    "m": "0.2",
+    "t": "0.25",
+    "t10": "200",
+    "t25": "350",
+    "t50": "600",
+    "t100": "1100",
+    "u": "0.26",
+}
 # Продление после истечения подписки (см. user_eligible_for_renewal_price).
 _PLAN_RENEW_AMOUNT_ENV_KEYS = {
     "s": ("CRYPTO_PAY_RENEW_AMOUNT_STANDART", "CRYPTO_PAY_RENEW_AMOUNT_S"),
     "p": ("CRYPTO_PAY_RENEW_AMOUNT_PRO", "CRYPTO_PAY_RENEW_AMOUNT_P"),
     "m": ("CRYPTO_PAY_RENEW_AMOUNT_MAX", "CRYPTO_PAY_RENEW_AMOUNT_M"),
     "t": ("CRYPTO_PAY_RENEW_AMOUNT_TEAM", "CRYPTO_PAY_RENEW_AMOUNT_T"),
+    "t10": ("CRYPTO_PAY_RENEW_AMOUNT_TEAM_10", "CRYPTO_PAY_RENEW_AMOUNT_T10"),
+    "t25": ("CRYPTO_PAY_RENEW_AMOUNT_TEAM_25", "CRYPTO_PAY_RENEW_AMOUNT_T25"),
+    "t50": ("CRYPTO_PAY_RENEW_AMOUNT_TEAM_50", "CRYPTO_PAY_RENEW_AMOUNT_T50"),
+    "t100": ("CRYPTO_PAY_RENEW_AMOUNT_TEAM_100", "CRYPTO_PAY_RENEW_AMOUNT_T100"),
     "u": ("CRYPTO_PAY_RENEW_AMOUNT_UNIQUEIZER", "CRYPTO_PAY_RENEW_AMOUNT_U"),
 }
-_PLAN_RENEW_AMOUNT_DEFAULT = {"s": "0.08", "p": "0.12", "m": "0.18", "t": "0.2", "u": "0.21"}
+_PLAN_RENEW_AMOUNT_DEFAULT = {
+    "s": "0.08",
+    "p": "0.12",
+    "m": "0.18",
+    "t": "0.2",
+    "t10": "165",
+    "t25": "285",
+    "t50": "525",
+    "t100": "925",
+    "u": "0.21",
+}
 
 
 def tariff_plan_invoice_label(code: str) -> str:
@@ -5082,6 +5341,9 @@ def tariff_plan_invoice_label(code: str) -> str:
 
 
 def crypto_pay_amount_for_plan(code: str, *, renewal: bool = False) -> str:
+    fixed = TEAM_FIXED_CRYPTO_AMOUNTS.get(code)
+    if fixed:
+        return fixed[1 if renewal else 0]
     if renewal:
         for ek in _PLAN_RENEW_AMOUNT_ENV_KEYS.get(code, ()):
             v = (os.environ.get(ek) or "").strip()
@@ -5100,9 +5362,23 @@ _PLAN_SUB_DAYS_ENV_KEYS = {
     "p": ("SUBSCRIPTION_DAYS_PRO", "SUBSCRIPTION_DAYS_P"),
     "m": ("SUBSCRIPTION_DAYS_MAX", "SUBSCRIPTION_DAYS_M"),
     "t": ("SUBSCRIPTION_DAYS_TEAM", "SUBSCRIPTION_DAYS_T"),
+    "t10": ("SUBSCRIPTION_DAYS_TEAM_10", "SUBSCRIPTION_DAYS_T10", "SUBSCRIPTION_DAYS_TEAM", "SUBSCRIPTION_DAYS_T"),
+    "t25": ("SUBSCRIPTION_DAYS_TEAM_25", "SUBSCRIPTION_DAYS_T25", "SUBSCRIPTION_DAYS_TEAM", "SUBSCRIPTION_DAYS_T"),
+    "t50": ("SUBSCRIPTION_DAYS_TEAM_50", "SUBSCRIPTION_DAYS_T50", "SUBSCRIPTION_DAYS_TEAM", "SUBSCRIPTION_DAYS_T"),
+    "t100": ("SUBSCRIPTION_DAYS_TEAM_100", "SUBSCRIPTION_DAYS_T100", "SUBSCRIPTION_DAYS_TEAM", "SUBSCRIPTION_DAYS_T"),
     "u": ("SUBSCRIPTION_DAYS_UNIQUEIZER", "SUBSCRIPTION_DAYS_U"),
 }
-_PLAN_SUB_DAYS_DEFAULT = {"s": 30, "p": 30, "m": 30, "t": 30, "u": 30}
+_PLAN_SUB_DAYS_DEFAULT = {
+    "s": 30,
+    "p": 30,
+    "m": 30,
+    "t": 30,
+    "t10": 30,
+    "t25": 30,
+    "t50": 30,
+    "t100": 30,
+    "u": 30,
+}
 
 
 def subscription_days_for_plan(code: str) -> int:
@@ -5112,7 +5388,8 @@ def subscription_days_for_plan(code: str) -> int:
             d = int(v)
             if d > 0:
                 return d
-    return max(1, int(_PLAN_SUB_DAYS_DEFAULT.get(code, 30)))
+    fb = "t" if code in TEAM_FIXED_TIER_CODES else code
+    return max(1, int(_PLAN_SUB_DAYS_DEFAULT.get(code, _PLAN_SUB_DAYS_DEFAULT.get(fb, 30))))
 
 
 async def crypto_pay_create_invoice(
@@ -5160,11 +5437,23 @@ async def crypto_pay_create_invoice(
     return str(pay_url), None
 
 
+@dp.callback_query(F.data == f"{UCB}:tteam")
+async def cb_user_tariff_team_menu(query: CallbackQuery):
+    if not await require_policies_or_block(query):
+        return
+    await show_tariff_team_pick_screen(query)
+    await query.answer()
+
+
 @dp.callback_query(F.data.startswith(f"{UCB}:tariff:"))
 async def cb_user_tariff_plan(query: CallbackQuery):
     if not await require_policies_or_block(query):
         return
     code = (query.data or "").split(":")[-1]
+    if code == "t":
+        await show_tariff_team_pick_screen(query)
+        await query.answer()
+        return
     if code not in _TARIFF_PLAN_ENV:
         await query.answer()
         return
@@ -5556,14 +5845,36 @@ async def process_team_name(message: Message, state: FSMContext):
             reply_markup=kb_team_setup_cancel(),
         )
         return
-    if team_get_by_owner(uid):
-        await state.set_state(UserTeamStates.seats_count)
-        await user_shell_answer_or_edit(
-            message,
-            text="Команда уже создана. Введите количество участников (целое число от 1 до 100).",
-            parse_mode=None,
-            reply_markup=kb_team_setup_cancel(),
-        )
+    existing = team_get_by_owner(uid)
+    if existing:
+        if user_may_purchase_team_seat_bundle(uid):
+            await state.set_state(UserTeamStates.seats_count)
+            await user_shell_answer_or_edit(
+                message,
+                text="Команда уже создана. Введите количество участников (целое число от 1 до 100).",
+                parse_mode=None,
+                reply_markup=kb_team_setup_cancel(),
+            )
+        else:
+            await state.clear()
+            slots = team_member_slots_total(existing, uid)
+            if slots > 0:
+                await user_shell_answer_or_edit(
+                    message,
+                    text=format_team_dashboard_html(existing, uid),
+                    parse_mode="HTML",
+                    reply_markup=kb_team_dashboard(uid),
+                )
+            else:
+                await user_shell_answer_or_edit(
+                    message,
+                    text=(
+                        "👥 <b>Команда</b>\n\n"
+                        "Оплатите пакет TEAM в разделе «Тарифы», чтобы активировать места."
+                    ),
+                    parse_mode="HTML",
+                    reply_markup=kb_user_back_main(),
+                )
         return
     if not team_create_for_owner(uid, raw):
         await user_shell_answer_or_edit(
@@ -5572,6 +5883,18 @@ async def process_team_name(message: Message, state: FSMContext):
             parse_mode=None,
             reply_markup=kb_team_setup_cancel(),
         )
+        return
+    if _user_plan_code_lower(user_get(uid)) == "m":
+        team_update_seats_and_cap(uid, 1, 1)
+        await state.clear()
+        team = team_get_by_owner(uid)
+        if team:
+            await user_shell_answer_or_edit(
+                message,
+                text=format_team_dashboard_html(team, uid),
+                parse_mode="HTML",
+                reply_markup=kb_team_dashboard(uid),
+            )
         return
     await state.set_state(UserTeamStates.seats_count)
     await user_shell_answer_or_edit(
@@ -5596,6 +5919,18 @@ async def process_team_seats(message: Message, state: FSMContext):
         return
     if not user_has_active_team_plan(uid):
         await state.clear()
+        return
+    if not user_may_purchase_team_seat_bundle(uid):
+        await state.clear()
+        await user_shell_answer_or_edit(
+            message,
+            text=(
+                "Места для этого сценария не продаются поштучно. Выберите пакет "
+                "<b>TEAM / TEAM PLUS / TEAM PRO / TEAM MAX</b> в разделе «Тарифы»."
+            ),
+            parse_mode="HTML",
+            reply_markup=kb_user_back_main(),
+        )
         return
     raw = (message.text or "").strip()
     try:
@@ -5686,6 +6021,15 @@ async def process_team_add_seats_count(message: Message, state: FSMContext):
     if not user_has_active_team_plan(uid):
         await state.clear()
         return
+    if not user_may_purchase_team_seat_bundle(uid):
+        await state.clear()
+        await user_shell_answer_or_edit(
+            message,
+            text="Докупка мест недоступна для вашего тарифа.",
+            parse_mode="HTML",
+            reply_markup=kb_user_back_main(),
+        )
+        return
     raw = (message.text or "").strip()
     try:
         n = int(raw)
@@ -5767,7 +6111,8 @@ async def process_team_add_member_id(message: Message, state: FSMContext):
         await state.clear()
         return
     team = team_get_by_owner(uid)
-    if not team or int(team.get("seats_purchased") or 0) < 1:
+    slots = team_member_slots_total(team, uid)
+    if not team or slots < 1:
         await state.clear()
         await user_shell_answer_or_edit(
             message,
@@ -5777,7 +6122,6 @@ async def process_team_add_member_id(message: Message, state: FSMContext):
         )
         return
     team_id = str(team["id"])
-    seats = int(team.get("seats_purchased") or 0)
     raw = (message.text or "").strip()
     tokens = [x for x in re.split(r"[\s,;]+", raw) if x.strip()]
     if not tokens:
@@ -5798,7 +6142,7 @@ async def process_team_add_member_id(message: Message, state: FSMContext):
             errs.append(f"Не число: <code>{esc_html(tok[:40])}</code>")
             continue
         ok, code = team_try_add_member(
-            team_id, uid, mid, occupied_slots=occupied, seats_total=seats
+            team_id, uid, mid, occupied_slots=occupied, seats_total=slots
         )
         if ok:
             added.append(mid)
@@ -5808,7 +6152,14 @@ async def process_team_add_member_id(message: Message, state: FSMContext):
         elif code == "owner":
             errs.append("Нельзя добавить свой собственный ID.")
         elif code == "full":
-            errs.append("Лимит мест исчерпан — оплатите дополнительные слоты.")
+            errs.append(
+                "Лимит мест исчерпан."
+                + (
+                    ""
+                    if not user_may_purchase_team_seat_bundle(uid)
+                    else " Оформите дополнительные слоты."
+                )
+            )
             break
         elif code == "not_owner":
             await state.clear()
@@ -5828,16 +6179,16 @@ async def process_team_add_member_id(message: Message, state: FSMContext):
         parts.append("✅ Добавлено: " + ", ".join(f"<code>{x}</code>" for x in added))
     if errs:
         parts.append("\n".join(errs))
-    free_now = max(0, seats - occupied)
+    free_now = max(0, slots - occupied)
     parts.append(
-        f"\nСвободных слотов: <b>{free_now}</b> из <b>{seats}</b>.\n"
+        f"\nСвободных слотов: <b>{free_now}</b> из <b>{slots}</b>.\n"
         "Отправьте ещё ID или откройте «Команда» для списка."
     )
     await user_shell_answer_or_edit(
         message,
         text="\n\n".join(parts),
         parse_mode="HTML",
-        reply_markup=kb_team_setup_cancel() if free_now > 0 else kb_team_dashboard(),
+        reply_markup=kb_team_setup_cancel() if free_now > 0 else kb_team_dashboard(uid),
     )
     if free_now <= 0:
         await state.clear()
