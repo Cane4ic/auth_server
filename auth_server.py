@@ -1,6 +1,6 @@
 """
 Сервер авторизации + Telegram-бот Neuro Uploader.
-API для приложения + админ-панель в Telegram (ADMIN_ID — один или несколько id через запяую).
+API для приложения + админ-панель в Telegram (ADMIN_ID — один или несколько id через запятую).
 """
 import asyncio
 import html
@@ -172,6 +172,39 @@ UCB = "u"
 CB_REF_MIN = f"{CB}:rwmin"
 
 PAGE_SIZE = 7
+
+# Кастомные эмодзи (icon_custom_emoji_id) для пользовательских кнопок бота
+EMOJI_BTN_REFERRALS = "6239746200073936067"
+EMOJI_BTN_TARIFFS = "6240204185321610823"
+EMOJI_BTN_PROFILE = "6239833121622072951"
+EMOJI_BTN_UNIQUEIZER = "6239994015391947568"
+EMOJI_BTN_SUPPORT = "6239968735214444420"
+EMOJI_BTN_REVIEWS = "6239908283549752038"
+EMOJI_TARIFF_MAX = "6240186442811710750"
+EMOJI_TARIFF_STANDART = "6240274919138008144"
+EMOJI_TARIFF_PRO = "6239929887235251301"
+EMOJI_TARIFF_TEAM = "6239986121242057870"
+EMOJI_BTN_BACK = "6240235439798624471"
+
+
+def _btn_uz_icon(text: str, callback_data: str, emoji_id: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(
+        text=text,
+        callback_data=callback_data,
+        icon_custom_emoji_id=emoji_id,
+    )
+
+
+def _btn_uz_icon_url(text: str, url: str, emoji_id: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(
+        text=text,
+        url=url,
+        icon_custom_emoji_id=emoji_id,
+    )
+
+
+def _btn_uz_back(text: str, callback_data: str) -> InlineKeyboardButton:
+    return _btn_uz_icon(text, callback_data, EMOJI_BTN_BACK)
 
 
 @asynccontextmanager
@@ -924,9 +957,9 @@ def uniqueizer_template_insert_row(telegram_id: int, name: str, levels: dict[str
 def kb_uniqueizer_hub() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📦 Уникализация", callback_data=f"{UCB}:uzrun")],
+            [_btn_uz_icon("Уникализация", f"{UCB}:uzrun", EMOJI_BTN_UNIQUEIZER)],
             [InlineKeyboardButton(text="📋 Шаблоны", callback_data=f"{UCB}:uztpl")],
-            [InlineKeyboardButton(text="⬅️ Главное меню", callback_data=f"{UCB}:main")],
+            [_btn_uz_back("Главное меню", f"{UCB}:main")],
         ]
     )
 
@@ -943,7 +976,7 @@ def kb_uniqueizer_tpl_empty() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="➕ Создать шаблон", callback_data=f"{UCB}:uznew")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{UCB}:uzhm")],
+            [_btn_uz_back("Назад", f"{UCB}:uzhm")],
         ]
     )
 
@@ -965,7 +998,7 @@ def kb_uniqueizer_tpl_list(uid: int, rows: list[dict], selected_id: Optional[str
             ]
         )
     lines.append([InlineKeyboardButton(text="➕ Создать шаблон", callback_data=f"{UCB}:uznew")])
-    lines.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{UCB}:uzhm")])
+    lines.append([_btn_uz_back("Назад", f"{UCB}:uzhm")])
     return InlineKeyboardMarkup(inline_keyboard=lines)
 
 
@@ -1019,7 +1052,7 @@ def kb_uniqueizer_session_tpl_pick(rows: list[dict]) -> InlineKeyboardMarkup:
                 )
             ]
         )
-    lines.append([InlineKeyboardButton(text="⬅️ К выбору способа", callback_data=f"{UCB}:uzrmb")])
+    lines.append([_btn_uz_back("К выбору способа", f"{UCB}:uzrmb")])
     lines.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"{UCB}:uzhm")])
     return InlineKeyboardMarkup(inline_keyboard=lines)
 
@@ -1045,7 +1078,7 @@ def kb_uniqueizer_adhoc_build(levels: dict[str, int]) -> InlineKeyboardMarkup:
     rows.append(
         [InlineKeyboardButton(text="✅ Далее — загрузить файл", callback_data=f"{UCB}:uzadgo")],
     )
-    rows.append([InlineKeyboardButton(text="⬅️ К выбору способа", callback_data=f"{UCB}:uzrmb")])
+    rows.append([_btn_uz_back("К выбору способа", f"{UCB}:uzrmb")])
     rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=f"{UCB}:uzhm")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -2692,21 +2725,21 @@ def kb_policies_accept():
 
 def kb_user_main_menu(telegram_user_id: Optional[int] = None):
     """Главное меню: Профиль|Отзывы, Тарифы|Рефералы, Уникализатор (всегда), «Команда» — при TEAM."""
-    profile_btn = InlineKeyboardButton(text="👤 Профиль", callback_data=f"{UCB}:profile")
+    profile_btn = _btn_uz_icon("Профиль", f"{UCB}:profile", EMOJI_BTN_PROFILE)
     # По требованию: «Отзывы» — просто картинка, поэтому всегда открываем callback.
-    reviews_btn = InlineKeyboardButton(text="⭐ Отзывы", callback_data=f"{UCB}:reviews")
+    reviews_btn = _btn_uz_icon("Отзывы", f"{UCB}:reviews", EMOJI_BTN_REVIEWS)
 
     if LINK_BUY:
-        tariffs_btn = InlineKeyboardButton(text="💳 Тарифы", url=LINK_BUY)
+        tariffs_btn = _btn_uz_icon_url("Тарифы", LINK_BUY, EMOJI_BTN_TARIFFS)
     else:
-        tariffs_btn = InlineKeyboardButton(text="💳 Тарифы", callback_data=f"{UCB}:buy")
+        tariffs_btn = _btn_uz_icon("Тарифы", f"{UCB}:buy", EMOJI_BTN_TARIFFS)
 
-    referrals_btn = InlineKeyboardButton(text="🎁 Рефералы", callback_data=f"{UCB}:referrals")
+    referrals_btn = _btn_uz_icon("Рефералы", f"{UCB}:referrals", EMOJI_BTN_REFERRALS)
 
     if LINK_SUPPORT:
-        support_btn = InlineKeyboardButton(text="💬 Поддержка", url=LINK_SUPPORT)
+        support_btn = _btn_uz_icon_url("Поддержка", LINK_SUPPORT, EMOJI_BTN_SUPPORT)
     else:
-        support_btn = InlineKeyboardButton(text="💬 Поддержка", callback_data=f"{UCB}:support")
+        support_btn = _btn_uz_icon("Поддержка", f"{UCB}:support", EMOJI_BTN_SUPPORT)
 
     rows: list[list[InlineKeyboardButton]] = [
         [profile_btn, reviews_btn],
@@ -2714,7 +2747,7 @@ def kb_user_main_menu(telegram_user_id: Optional[int] = None):
     ]
     if telegram_user_id is not None:
         rows.append(
-            [InlineKeyboardButton(text="🎯 Уникализатор", callback_data=f"{UCB}:uniqueizer")]
+            [_btn_uz_icon("Уникализатор", f"{UCB}:uniqueizer", EMOJI_BTN_UNIQUEIZER)]
         )
     if telegram_user_id is not None and user_has_active_team_plan(telegram_user_id):
         rows.append(
@@ -2727,7 +2760,7 @@ def kb_user_main_menu(telegram_user_id: Optional[int] = None):
 def kb_user_back_main():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Главное меню", callback_data=f"{UCB}:main")],
+            [_btn_uz_back("Главное меню", f"{UCB}:main")],
         ]
     )
 
@@ -2736,7 +2769,7 @@ def kb_referrals_screen():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="💸 Вывести", callback_data=f"{UCB}:refw")],
-            [InlineKeyboardButton(text="⬅️ Главное меню", callback_data=f"{UCB}:main")],
+            [_btn_uz_back("Главное меню", f"{UCB}:main")],
         ]
     )
 
@@ -2788,12 +2821,12 @@ def text_uniqueizer_screen_html() -> str:
 def kb_tariffs():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="STANDART", callback_data=f"{UCB}:tariff:s")],
-            [InlineKeyboardButton(text="PRO", callback_data=f"{UCB}:tariff:p")],
-            [InlineKeyboardButton(text="MAX", callback_data=f"{UCB}:tariff:m")],
-            [InlineKeyboardButton(text="TEAM", callback_data=f"{UCB}:tariff:t")],
+            [_btn_uz_icon("STANDART", f"{UCB}:tariff:s", EMOJI_TARIFF_STANDART)],
+            [_btn_uz_icon("PRO", f"{UCB}:tariff:p", EMOJI_TARIFF_PRO)],
+            [_btn_uz_icon("MAX", f"{UCB}:tariff:m", EMOJI_TARIFF_MAX)],
+            [_btn_uz_icon("TEAM", f"{UCB}:tariff:t", EMOJI_TARIFF_TEAM)],
             [InlineKeyboardButton(text="UNIQUEIZER", callback_data=f"{UCB}:tariff:u")],
-            [InlineKeyboardButton(text="⬅️ Главное меню", callback_data=f"{UCB}:main")],
+            [_btn_uz_back("Главное меню", f"{UCB}:main")],
         ]
     )
 
@@ -2803,8 +2836,8 @@ def kb_tariff_subplan_detail(code: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="💳 Купить", callback_data=f"{UCB}:tbuy:{code}")],
-            [InlineKeyboardButton(text="⬅️ К тарифам", callback_data=f"{UCB}:tariffs_menu")],
-            [InlineKeyboardButton(text="🏠 Главное меню", callback_data=f"{UCB}:main")],
+            [_btn_uz_back("К тарифам", f"{UCB}:tariffs_menu")],
+            [_btn_uz_back("Главное меню", f"{UCB}:main")],
         ]
     )
 
@@ -2813,8 +2846,8 @@ def kb_tariff_after_invoice(code: str, pay_url: str) -> InlineKeyboardMarkup:
     """После createInvoice: открытие оплаты в Crypto Bot + навигация."""
     rows: list[list[InlineKeyboardButton]] = [
         [InlineKeyboardButton(text="💎 Оплатить в Crypto Bot", url=pay_url)],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{UCB}:tariff:{code}")],
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data=f"{UCB}:main")],
+        [_btn_uz_back("Назад", f"{UCB}:tariff:{code}")],
+        [_btn_uz_back("Главное меню", f"{UCB}:main")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -2823,8 +2856,8 @@ def kb_team_after_invoice(pay_url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="💎 Оплатить в Crypto Bot", url=pay_url)],
-            [InlineKeyboardButton(text="⬅️ К разделу «Команда»", callback_data=f"{UCB}:team")],
-            [InlineKeyboardButton(text="🏠 Главное меню", callback_data=f"{UCB}:main")],
+            [_btn_uz_back("К разделу «Команда»", f"{UCB}:team")],
+            [_btn_uz_back("Главное меню", f"{UCB}:main")],
         ]
     )
 
@@ -2852,7 +2885,7 @@ def kb_team_dashboard() -> InlineKeyboardMarkup:
                     callback_data=f"{UCB}:team_add_member",
                 )
             ],
-            [InlineKeyboardButton(text="⬅️ Главное меню", callback_data=f"{UCB}:main")],
+            [_btn_uz_back("Главное меню", f"{UCB}:main")],
         ]
     )
 
@@ -4236,7 +4269,7 @@ async def cb_uniqueizer_path_pick_template(query: CallbackQuery, state: FSMConte
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
                     [InlineKeyboardButton(text="➕ Создать шаблон", callback_data=f"{UCB}:uznew")],
-                    [InlineKeyboardButton(text="⬅️ К выбору способа", callback_data=f"{UCB}:uzrmb")],
+                    [_btn_uz_back("К выбору способа", f"{UCB}:uzrmb")],
                     [InlineKeyboardButton(text="❌ Отмена", callback_data=f"{UCB}:uzhm")],
                 ]
             ),
@@ -4676,6 +4709,7 @@ async def uniqueizer_receive_media(message: Message, state: FSMContext):
                 inline_keyboard=[
                     [InlineKeyboardButton(text="📋 Шаблоны", callback_data=f"{UCB}:uztpl")],
                     [InlineKeyboardButton(text="❌ Отмена", callback_data=f"{UCB}:uzhm")],
+                    [_btn_uz_back("Главное меню", f"{UCB}:main")],
                 ]
             ),
         )
@@ -4692,6 +4726,7 @@ async def uniqueizer_receive_media(message: Message, state: FSMContext):
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
                     [InlineKeyboardButton(text="📋 Шаблоны", callback_data=f"{UCB}:uztpl")],
+                    [_btn_uz_back("Главное меню", f"{UCB}:main")],
                 ]
             ),
         )
