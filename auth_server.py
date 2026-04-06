@@ -185,6 +185,17 @@ EMOJI_TARIFF_STANDART = "6240274919138008144"
 EMOJI_TARIFF_PRO = "6239929887235251301"
 EMOJI_TARIFF_TEAM = "6239986121242057870"
 EMOJI_BTN_BACK = "6240235439798624471"
+# Заголовки блоков в экране «Профиль» (подпись к tg-emoji)
+EMOJI_PROFILE_SECTION = "6240132665526197098"
+EMOJI_PROFILE_APPLICATION = "6239798869257887565"
+
+
+def _profile_html_heading(emoji_id: str, fallback_char: str, title_inner_html: str) -> str:
+    """Строка заголовка блока профиля: кастомный эмодзи (HTML) + заголовок."""
+    return (
+        f'<tg-emoji emoji-id="{esc_html(emoji_id)}">{fallback_char}</tg-emoji> '
+        f"{title_inner_html}"
+    )
 
 
 def _btn_uz_icon(text: str, callback_data: str, emoji_id: str) -> InlineKeyboardButton:
@@ -2896,12 +2907,14 @@ def text_user_main_menu() -> str:
 
 
 def build_user_profile_public_text(tid: int, u: Optional[dict]) -> str:
-    """Профиль для обычного пользователя (без HWID)."""
+    """Профиль для обычного пользователя (без HWID). Кастомные эмодзи — тег tg-emoji в HTML."""
     if not u:
+        h = _profile_html_heading(EMOJI_PROFILE_SECTION, "👤", "<b>Профиль</b>")
         return (
-            "👤 <b>Профиль</b>\n\n"
-            "Запись в базе не найдена. После покупки подписки данные появятся здесь.\n\n"
-            "Используйте «Купить подписку», если ещё не оформляли доступ."
+            f"{h}\n"
+            "⊢ <i>Запись в базе не найдена.</i>\n"
+            "⊢ После покупки подписки данные появятся здесь.\n\n"
+            "Используйте раздел <b>Тарифы</b>, если ещё не оформляли доступ."
         )
     now = int(time.time())
     sub = int(u.get("subscription_until") or 0)
@@ -2923,18 +2936,32 @@ def build_user_profile_public_text(tid: int, u: Optional[dict]) -> str:
     app_until_disp = fmt_ts(sub) if app_plan_code and sub > 0 else "—"
     uniq_until_disp = fmt_ts(uz_until) if uz_until > 0 else "—"
 
-    username = (u.get("username") or "").strip() or "—"
-    return (
-        "👤 <b>Профиль</b>\n\n"
-        f"Username: <b>{esc_html(username)}</b>\n"
-        f"ID: <code>{tid}</code>\n\n"
-        "<b>Приложение</b>\n"
-        f"Тариф: <b>{esc_html(app_label)}</b> — <b>{esc_html(app_word)}</b>\n"
-        f"До (UTC): <b>{esc_html(app_until_disp)}</b>\n\n"
-        "<b>Уникализатор</b> (бот)\n"
-        f"Доступ: <b>{esc_html(uniq_word)}</b>\n"
-        f"До (UTC): <b>{esc_html(uniq_until_disp)}</b>\n"
+    raw_u = (u.get("username") or "").strip()
+    if raw_u:
+        un_disp = raw_u if raw_u.startswith("@") else f"@{raw_u}"
+    else:
+        un_disp = "—"
+    un_html = esc_html(un_disp)
+
+    blk_profile = _profile_html_heading(EMOJI_PROFILE_SECTION, "👤", "<b>Профиль</b>")
+    lines_profile = (
+        f"\n⊢ Username: <b>{un_html}</b>\n"
+        f"⊢ ID: <code>{tid}</code>\n"
     )
+
+    blk_app = _profile_html_heading(EMOJI_PROFILE_APPLICATION, "📱", "<b>Приложение</b>")
+    lines_app = (
+        f"\n⊢ Тариф: <b>{esc_html(app_label)}</b> — <b>{esc_html(app_word)}</b>\n"
+        f"⊢ До (UTC): <b>{esc_html(app_until_disp)}</b>\n"
+    )
+
+    blk_uz = _profile_html_heading(EMOJI_BTN_UNIQUEIZER, "🎯", "<b>Уникализатор</b> (бот)")
+    lines_uz = (
+        f"\n⊢ Доступ: <b>{esc_html(uniq_word)}</b>\n"
+        f"⊢ До (UTC): <b>{esc_html(uniq_until_disp)}</b>\n"
+    )
+
+    return blk_profile + lines_profile + "\n" + blk_app + lines_app + "\n" + blk_uz + lines_uz
 
 
 def kb_list_nav(page: int, total_pages: int):
