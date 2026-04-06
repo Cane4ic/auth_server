@@ -28,7 +28,7 @@ import uvicorn
 from aiogram import Bot, Dispatcher, F
 from aiogram.dispatcher.event.bases import UNHANDLED
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.enums import ChatMemberStatus
+from aiogram.enums import ChatMemberStatus, MessageEntityType
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -261,6 +261,7 @@ class AdminStates(StatesGroup):
     app_txt_wait = State()
     broadcast_wait = State()
     broadcast_confirm = State()
+    custom_emoji_wait = State()
 
 
 class UserReferralWithdrawStates(StatesGroup):
@@ -2524,9 +2525,40 @@ def kb_main_admin():
             [InlineKeyboardButton(text="💳 Описания тарифов", callback_data=f"{CB}:tpl")],
             [InlineKeyboardButton(text="🎁 Реферальный %", callback_data=f"{CB}:refpct")],
             [InlineKeyboardButton(text="📢 Рассылка", callback_data=f"{CB}:broadcast")],
+            [InlineKeyboardButton(text="🆔 ID кастомных эмодзи", callback_data=f"{CB}:emojiid")],
             [InlineKeyboardButton(text="ℹ️ Справка", callback_data=f"{CB}:help")],
         ]
     )
+
+
+def kb_admin_emoji_id_back() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Админ-меню", callback_data=f"{CB}:menu")],
+        ]
+    )
+
+
+def _admin_collect_custom_emoji_ids(message: Message) -> list[str]:
+    """Собирает уникальные custom_emoji_id из текста, подписи и стикера."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for coll in (message.entities, message.caption_entities):
+        if not coll:
+            continue
+        for e in coll:
+            if e.type == MessageEntityType.CUSTOM_EMOJI:
+                cid = getattr(e, "custom_emoji_id", None)
+                if cid and str(cid) not in seen:
+                    seen.add(str(cid))
+                    out.append(str(cid))
+    st = message.sticker
+    if st and getattr(st, "custom_emoji_id", None):
+        cid = str(st.custom_emoji_id)
+        if cid not in seen:
+            seen.add(cid)
+            out.append(cid)
+    return out
 
 
 def kb_admin_tariff_plans():
@@ -5780,7 +5812,8 @@ async def cmd_admin(message: Message, state: FSMContext):
         "• Просмотр пользователей и подписок\n"
         "• Изменение срока подписки\n"
         "• Сброс и ручная установка HWID\n"
-        "• Рассылка всем пользователям из базы\n\n"
+        "• Рассылка всем пользователям из базы\n"
+        "• **🆔 ID кастомных эмодзи** — кнопка ниже: пришлите эмодзи, бот вернёт `custom_emoji_id`\n\n"
         "Команды: `/add ID дней`, `/reset ID`\n"
         "Файлы после оплаты: `/set_app_zip` → затем отправьте zip; `/set_app_txt` → затем txt.",
         parse_mode="Markdown",
@@ -6035,6 +6068,52 @@ async def cb_menu(query: CallbackQuery, state: FSMContext):
     await query.answer()
 
 
+@dp.callback_query(F.data == f"{CB}:emojiid")
+async def cb_admin_custom_emoji_mode(query: CallbackQuery, state: FSMContext):
+    if not is_admin(query.from_user.id):
+        await query.answer("⛔", show_alert=True)
+        return
+    await state.set_state(AdminStates.custom_emoji_wait)
+    await safe_edit_text(
+        query.message,
+        "🆔 <b>ID кастомных эмодзи</b>\n\n"
+        "Пришлите сообщение с <b>кастомным эмодзи</b> (нужен Telegram Premium у отправителя) "
+        "или стикер типа «кастомный эмодзи» из набора.\n\n"
+        "Бот ответит значениями <code>custom_emoji_id</code> — их можно подставлять в сущности "
+        "сообщения при отправке из кода (см. Bot API: custom emoji).\n\n"
+        "Можно присылать сколько угодно сообщений подряд. "
+        "<code>/cancel</code> или кнопка «Админ-меню» — выход.",
+        parse_mode="HTML",
+        reply_markup=kb_admin_emoji_id_back(),
+    )
+    await query.answer()
+
+
+@dp.message(AdminStates.custom_emoji_wait)
+async def admin_custom_emoji_collect(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    if (message.text or "").strip().startswith("/"):
+        return
+    ids = _admin_collect_custom_emoji_ids(message)
+    if not ids:
+        await message.answer(
+            "Не найдено <code>custom_emoji_id</code> в этом сообщении.\n\n"
+            "• Вставьте в текст кастомный эмодзи из панели.\n"
+            "• Или отправьте стикер «кастомный эмодзи», а не обычный .webp-стикер.",
+            parse_mode="HTML",
+            reply_markup=kb_admin_emoji_id_back(),
+        )
+        return
+    body = "\n".join(f"<code>{esc_html(i)}</code>" for i in ids)
+    await message.answer(
+        f"🆔 <b>custom_emoji_id</b> ({len(ids)} шт.):\n\n" + body,
+        parse_mode="HTML",
+        reply_markup=kb_admin_emoji_id_back(),
+    )
+
+
 @dp.callback_query(F.data == f"{CB}:help")
 async def cb_help(query: CallbackQuery):
     if not is_admin(query.from_user.id):
@@ -6051,7 +6130,8 @@ async def cb_help(query: CallbackQuery):
         "• **Реферальный %** — доля с каждой оплаты приглашённого; там же **мин. вывод** реф. баланса.\n"
         "• **Реф. баланс** в карточке пользователя — задать **доступную к выводу** сумму (USD).\n"
         "• **Описания тарифов** — HTML карточки STANDART/PRO/MAX/TEAM/UNIQUEIZER (цены в тексте); списание в Crypto Pay — .env.\n"
-        "• **Рассылка** — одно сообщение всем из `users` (копирование: текст, фото, документ и т.д.).\n\n"
+        "• **Рассылка** — одно сообщение всем из `users` (копирование: текст, фото, документ и т.д.).\n"
+        "• **🆔 ID кастомных эмодзи** — пришлите кастомный эмодзи или стикер; бот вернёт `custom_emoji_id` для кода.\n\n"
         "/cancel — отменить ввод.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(
