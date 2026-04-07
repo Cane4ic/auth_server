@@ -136,6 +136,18 @@ CRYPTO_PAY_TESTNET = (os.environ.get("CRYPTO_PAY_TESTNET") or "true").strip().lo
     "on",
 )
 CRYPTO_PAY_ASSET = (os.environ.get("CRYPTO_PAY_ASSET") or "TON").strip().upper()
+# Манифест автообновления десктоп-приложения (onedir): GET /api/app/update/manifest
+NEURO_APP_LATEST_VERSION = (os.environ.get("NEURO_APP_LATEST_VERSION") or "").strip()
+NEURO_APP_DOWNLOAD_URL = (os.environ.get("NEURO_APP_DOWNLOAD_URL") or "").strip()
+NEURO_APP_SHA256 = (os.environ.get("NEURO_APP_SHA256") or "").strip()
+NEURO_APP_MIN_SUPPORTED_VERSION = (os.environ.get("NEURO_APP_MIN_SUPPORTED_VERSION") or "").strip()
+NEURO_APP_RELEASE_NOTES = (os.environ.get("NEURO_APP_RELEASE_NOTES") or "").strip()
+NEURO_APP_UPDATE_MANDATORY = (os.environ.get("NEURO_APP_UPDATE_MANDATORY") or "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 # Текст «$ за место» в боте; сумма в крипте — CRYPTO_PAY_AMOUNT_TEAM_SEAT × места (см. team_bundle_crypto_amount_str).
 TEAM_SEAT_PRICE_USD = float((os.environ.get("TEAM_SEAT_PRICE_USD") or "10").strip() or "10")
 REFERRAL_PERCENT_DEFAULT = float((os.environ.get("REFERRAL_PERCENT_DEFAULT") or "10").strip())
@@ -775,15 +787,16 @@ def _user_plan_code_lower(u: Optional[dict]) -> str:
     return (u.get("subscription_plan") or "").strip().lower()
 
 
-# Планы TEAM: legacy «t» (докупка мест) и фикс-пакеты t10…t100
+# Планы TEAM: legacy «t» (докупка мест до 10 слотов); t10; TEAM PLUS t25; TEAM PRO t50; TEAM MAX t100.
+# Тариф MAX (m): одно бесплатное место в команде — см. team_member_slots_total / process_team_name.
 TEAM_TIER_CODES = frozenset({"t", "t10", "t25", "t50", "t100"})
 TEAM_FIXED_TIER_CODES = frozenset({"t10", "t25", "t50", "t100"})
 TEAM_TIER_SEAT_CAP: dict[str, int] = {
     "t": 10,
     "t10": 10,
-    "t25": 25,
-    "t50": 50,
-    "t100": 100,
+    "t25": 25,  # TEAM PLUS
+    "t50": 50,  # TEAM PRO
+    "t100": 100,  # TEAM MAX (команда)
 }
 # Суммы Crypto Pay (USDT и т.п.): покупка / продление
 TEAM_FIXED_CRYPTO_AMOUNTS: dict[str, tuple[str, str]] = {
@@ -3194,6 +3207,7 @@ async def root():
         "docs": "/docs",
         "health": "/health",
         "ping": "/api/auth/ping",
+        "app_update_manifest": "/api/app/update/manifest",
         "crypto_pay_webhook": "/api/crypto-pay/webhook",
         "crypto_pay_webhook_root": "POST / (алиас, если в Crypto Pay указан только корень домена)",
     }
@@ -3209,6 +3223,25 @@ async def health():
 async def auth_ping():
     """Проверка из браузера: откройте URL в новой вкладке или fetch с localhost."""
     return {"ok": True}
+
+
+@app.get("/api/app/update/manifest")
+async def app_update_manifest(platform: str = "win"):
+    """Манифест релиза для десктопа: версия, ссылка на архив/zip, sha256. Настройка через NEURO_APP_* в .env."""
+    pl = (platform or "win").strip().lower()
+    if pl in ("windows", "win32"):
+        pl = "win"
+    if pl != "win":
+        pl = "win"
+    return {
+        "platform": pl,
+        "latest_version": NEURO_APP_LATEST_VERSION or None,
+        "min_supported_version": NEURO_APP_MIN_SUPPORTED_VERSION or None,
+        "download_url": NEURO_APP_DOWNLOAD_URL or None,
+        "sha256": NEURO_APP_SHA256 or None,
+        "release_notes": NEURO_APP_RELEASE_NOTES or None,
+        "mandatory": NEURO_APP_UPDATE_MANDATORY,
+    }
 
 
 @app.post("/api/crypto-pay/webhook")
@@ -5056,12 +5089,15 @@ async def cb_team_add_member(query: CallbackQuery, state: FSMContext):
         return
     uid = query.from_user.id
     if not user_has_active_team_plan(uid):
-        await query.answer("Доступно только при активной подписке TEAM.", show_alert=True)
+        await query.answer(
+            "Доступно при MAX (1 место в команде) или тарифах TEAM / TEAM PLUS / TEAM PRO / TEAM MAX.",
+            show_alert=True,
+        )
         return
     team = team_get_by_owner(uid)
     slots = team_member_slots_total(team, uid) if team else 0
     if not team or slots < 1:
-        await query.answer("Сначала завершите создание команды и оплату мест.", show_alert=True)
+        await query.answer("Сначала создайте команду в боте и при необходимости оплатите пакет мест.", show_alert=True)
         return
     team_id = str(team["id"])
     if team_members_count(team_id) >= slots:
@@ -5222,7 +5258,8 @@ _TARIFF_PLAN_DEFAULT = {
         "• Расширенная уникализация\n"
         "• Прогрев аккаунтов\n"
         "• Приоритетная поддержка\n"
-        "• Доступ к ИИ"
+        "• Доступ к ИИ\n"
+        "• <b>Команда:</b> одно бесплатное место для участника (раздел «Команда» в боте, без докупки)"
     ),
     "t": (
         "<b>TEAM</b>\n\n"
