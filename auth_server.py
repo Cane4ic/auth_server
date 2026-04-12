@@ -320,6 +320,15 @@ class AdminStates(StatesGroup):
     broadcast_confirm = State()
     custom_emoji_wait = State()
     user_search_id = State()
+    promo_code = State()
+    promo_discount = State()
+    promo_valid_until = State()
+    promo_max_uses = State()
+
+
+class UserProfileStates(StatesGroup):
+    """Профиль: ввод промокода."""
+    promo_wait = State()
 
 
 class UserReferralWithdrawStates(StatesGroup):
@@ -2139,11 +2148,13 @@ def verify_crypto_pay_webhook_signature(body_text: str, signature_header: str, a
     return compare_digest(expected, signature_header.strip())
 
 
-def parse_nu_crypto_invoice_payload(raw: Optional[str]) -> tuple[Optional[str], Optional[int], bool]:
-    """Поле payload счёта: nu_plan=s;tg=...;renew=0|1. Третий элемент — тариф продления."""
+def parse_nu_crypto_invoice_payload(
+    raw: Optional[str],
+) -> tuple[Optional[str], Optional[int], bool, Optional[str]]:
+    """Поле payload счёта: nu_plan=s;tg=...;renew=0|1;promo=<uuid>."""
     if not raw or not isinstance(raw, str):
-        return None, None, False
-    plan, tg = None, None
+        return None, None, False, None
+    plan, tg, promo = None, None, None
     renew = False
     for part in raw.split(";"):
         part = part.strip()
@@ -2156,7 +2167,264 @@ def parse_nu_crypto_invoice_payload(raw: Optional[str]) -> tuple[Optional[str], 
                 pass
         elif part.startswith("renew="):
             renew = part[6:].strip() == "1"
-    return plan, tg, renew
+        elif part.startswith("promo="):
+            p = part[6:].strip()
+            if p:
+                promo = p
+    return plan, tg, renew, promo
+
+
+# --- Промокоды (скидка на тарифы Crypto Pay) ---------------------------------
+
+
+def promo_normalize_code(raw: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9_]", "", (raw or "").strip())
+    return s.upper()[:40]
+
+
+def crypto_amount_apply_discount_percent(amount_str: str, discount_percent: int) -> str:
+    """Уменьшает сумму счёта на discount_percent % (1–99), не ниже 0.01."""
+    try:
+        x = float(str(amount_str).replace(",", ".").strip())
+    except (TypeError, ValueError):
+        return amount_str
+    p = max(1, min(99, int(discount_percent)))
+    y = max(0.01, x * (100 - p) / 100.0)
+    if y >= 1.0 and abs(y - round(y)) < 1e-6:
+        return str(int(round(y)))
+    s = f"{y:.10f}".rstrip("0").rstrip(".")
+    return s if s else "0.01"
+
+
+def promo_get_by_id(promo_id: str) -> Optional[dict]:
+    try:
+        r = (
+            supabase.table("promo_codes")
+            .select("*")
+            .eq("id", str(promo_id).strip())
+            .limit(1)
+            .execute()
+        )
+        return r.data[0] if r.data else None
+    except Exception as e:
+        print(f"promo_get_by_id {promo_id}: {e}")
+        return None
+
+
+def promo_user_has_redeemed(telegram_id: int, promo_id: str) -> bool:
+    try:
+        r = (
+            supabase.table("promo_redemptions")
+            .select("id")
+            .eq("promo_code_id", str(promo_id))
+            .eq("telegram_id", telegram_id)
+            .limit(1)
+            .execute()
+        )
+        return bool(r.data)
+    except Exception as e:
+        print(f"promo_user_has_redeemed: {e}")
+        return True
+
+
+def promo_row_validate_for_apply(telegram_id: int, row: dict) -> Optional[str]:
+    """None если можно применить к пользователю (ещё не оплатил этим кодом)."""
+    if not row.get("is_active", True):
+        return "Промокод отключён."
+    now = int(time.time())
+    vu = int(row.get("valid_until") or 0)
+    if vu > 0 and now > vu:
+        return "Срок действия промокода истёк."
+    mx = row.get("max_uses")
+    if mx is not None:
+        try:
+            mxi = int(mx)
+            if mxi > 0 and int(row.get("uses_count") or 0) >= mxi:
+                return "Лимит активаций промокода исчерпан."
+        except (TypeError, ValueError):
+            pass
+    pid = str(row.get("id") or "")
+    if pid and promo_user_has_redeemed(telegram_id, pid):
+        return "Вы уже использовали этот промокод."
+    return None
+
+
+def promo_row_ok_for_discounted_invoice(telegram_id: int, row: dict) -> bool:
+    """Перед выставлением счёта: скидка допустима."""
+    return promo_row_validate_for_apply(telegram_id, row) is None
+
+
+def user_clear_promo_pending(telegram_id: int) -> None:
+    try:
+        supabase.table("users").update({"promo_pending_id": None}).eq("telegram_id", telegram_id).execute()
+    except Exception as e:
+        print(f"user_clear_promo_pending {telegram_id}: {e}")
+
+
+def promo_try_apply_user_code(telegram_id: int, raw_code: str) -> tuple[bool, str]:
+    code = promo_normalize_code(raw_code)
+    if len(code) < 3:
+        return False, "Код минимум из 3 символов (латиница, цифры, _)."
+    try:
+        r = supabase.table("promo_codes").select("*").eq("code", code).limit(1).execute()
+        row = r.data[0] if r.data else None
+    except Exception as e:
+        return False, f"Ошибка базы: {e!s}"
+    if not row:
+        return False, "Промокод не найден."
+    err = promo_row_validate_for_apply(telegram_id, row)
+    if err:
+        return False, err
+    pid = str(row.get("id") or "")
+    try:
+        supabase.table("users").update({"promo_pending_id": pid}).eq("telegram_id", telegram_id).execute()
+    except Exception as e:
+        err_s = str(e).lower()
+        if "promo_pending_id" in err_s or "column" in err_s:
+            return (
+                False,
+                "Выполните SQL из файла <code>promo_codes.sql</code> в Supabase (колонка и таблицы).",
+            )
+        return False, f"Не удалось сохранить: {e!s}"
+    pct = int(row.get("discount_percent") or 0)
+    return True, f"Промокод <b>{esc_html(code)}</b>: скидка <b>{pct}%</b> на следующую оплату тарифа в боте."
+
+
+def promo_pending_summary_html(tid: int, u: Optional[dict]) -> str:
+    if not u:
+        return ""
+    pid = u.get("promo_pending_id")
+    if not pid:
+        return ""
+    row = promo_get_by_id(str(pid))
+    if not row:
+        return ""
+    err = promo_row_validate_for_apply(tid, row)
+    if err:
+        return f"\n⊢ Промокод в профиле: <i>{esc_html(err)} — выберите другой.</i>\n"
+    pct = int(row.get("discount_percent") or 0)
+    code = esc_html(str(row.get("code") or ""))
+    return f"\n⊢ Активный промокод: <b>{code}</b> — скидка <b>{pct}%</b> на оплату тарифа.\n"
+
+
+def promo_redeem_on_payment(telegram_id: int, promo_id: str, invoice_id: int) -> None:
+    now = int(time.time())
+    try:
+        supabase.table("promo_redemptions").insert(
+            {
+                "promo_code_id": str(promo_id),
+                "telegram_id": telegram_id,
+                "invoice_id": invoice_id,
+                "created_at": now,
+            }
+        ).execute()
+    except Exception as e:
+        err = str(e).lower()
+        if "23505" in str(e) or "duplicate" in err or "unique" in err:
+            return
+        print(f"promo_redemptions insert: {e}")
+        return
+    try:
+        r = (
+            supabase.table("promo_codes")
+            .select("uses_count")
+            .eq("id", str(promo_id))
+            .limit(1)
+            .execute()
+        )
+        c = int(r.data[0].get("uses_count") or 0) + 1 if r.data else 1
+        supabase.table("promo_codes").update({"uses_count": c}).eq("id", str(promo_id)).execute()
+    except Exception as e:
+        print(f"promo uses_count update: {e}")
+
+
+def promo_parse_valid_until_date(raw: str) -> Optional[int]:
+    """Дата окончания: конец дня UTC. Форматы DD.MM.YYYY, DD.MM.YY, YYYY-MM-DD."""
+    s = (raw or "").strip()
+    for fmt in ("%d.%m.%Y", "%d.%m.%y", "%Y-%m-%d"):
+        try:
+            dt_naive = datetime.strptime(s, fmt)
+            dt = dt_naive.replace(tzinfo=timezone.utc).replace(
+                hour=23, minute=59, second=59, microsecond=0
+            )
+            return int(dt.timestamp())
+        except ValueError:
+            continue
+    return None
+
+
+def promo_parse_max_uses(raw: str) -> Optional[int]:
+    """None = без лимита. Иначе целое >= 1."""
+    s = (raw or "").strip().lower()
+    if not s or s in ("0", "inf", "infinity", "∞", "беск", "бесконечно", "нет", "none", "unlimited"):
+        return None
+    try:
+        n = int(s)
+        return n if n >= 1 else None
+    except ValueError:
+        return -1
+
+
+def promo_insert_row(
+    code: str,
+    discount_percent: int,
+    valid_until_ts: int,
+    max_uses: Optional[int],
+) -> Optional[str]:
+    code_n = promo_normalize_code(code)
+    if len(code_n) < 3:
+        return None
+    pct = max(1, min(99, int(discount_percent)))
+    now = int(time.time())
+    row = {
+        "code": code_n,
+        "discount_percent": pct,
+        "valid_until": int(valid_until_ts),
+        "max_uses": max_uses,
+        "uses_count": 0,
+        "is_active": True,
+        "created_at": now,
+    }
+    try:
+        r = supabase.table("promo_codes").insert(row).execute()
+        if r.data:
+            return str(r.data[0].get("id") or "")
+    except Exception as e:
+        print(f"promo_insert_row: {e}")
+    return None
+
+
+def promo_list_recent(limit: int = 30) -> list[dict]:
+    try:
+        r = (
+            supabase.table("promo_codes")
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return list(r.data or [])
+    except Exception as e:
+        print(f"promo_list_recent: {e}")
+        return []
+
+
+def promo_set_active(promo_id: str, active: bool) -> bool:
+    try:
+        supabase.table("promo_codes").update({"is_active": active}).eq("id", str(promo_id)).execute()
+        return True
+    except Exception as e:
+        print(f"promo_set_active: {e}")
+        return False
+
+
+def promo_delete_row(promo_id: str) -> bool:
+    try:
+        supabase.table("promo_codes").delete().eq("id", str(promo_id)).execute()
+        return True
+    except Exception as e:
+        print(f"promo_delete_row: {e}")
+        return False
 
 
 def crypto_invoice_mark_processed(invoice_id: int, telegram_id: int, plan_code: str) -> str:
@@ -2782,6 +3050,7 @@ def kb_main_admin():
         inline_keyboard=[
             [InlineKeyboardButton(text="📋 Все пользователи", callback_data=f"{CB}:list:0")],
             [InlineKeyboardButton(text="🔍 Найти по Telegram ID", callback_data=f"{CB}:usid")],
+            [InlineKeyboardButton(text="🎫 Промокоды", callback_data=f"{CB}:promo")],
             [InlineKeyboardButton(text="💳 Описания тарифов", callback_data=f"{CB}:tpl")],
             [InlineKeyboardButton(text="🎁 Реферальный %", callback_data=f"{CB}:refpct")],
             [InlineKeyboardButton(text="📢 Рассылка", callback_data=f"{CB}:broadcast")],
@@ -2991,6 +3260,15 @@ def kb_user_main_menu(telegram_user_id: Optional[int] = None):
 def kb_user_back_main():
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [_btn_uz_back("Главное меню", f"{UCB}:main")],
+        ]
+    )
+
+
+def kb_user_profile() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🎫 Промокод", callback_data=f"{UCB}:profile_promo")],
             [_btn_uz_back("Главное меню", f"{UCB}:main")],
         ]
     )
@@ -3218,7 +3496,7 @@ def build_user_profile_public_text(tid: int, u: Optional[dict]) -> str:
     lines_profile = (
         f"\n⊢ Username: <b>{un_html}</b>\n"
         f"⊢ ID: <code>{tid}</code>\n"
-    )
+    ) + promo_pending_summary_html(tid, u)
 
     blk_app = _profile_html_heading(EMOJI_PROFILE_APPLICATION, "📱", "<b>Приложение</b>")
     lines_app = (
@@ -3419,7 +3697,9 @@ async def crypto_pay_webhook(request: Request):
                 print(f"crypto pay team_bundle: уведомление пользователю {telegram_id}: {e}")
         return PlainTextResponse("OK", status_code=200)
 
-    plan_code, telegram_id, is_renewal_price = parse_nu_crypto_invoice_payload(inv.get("payload"))
+    plan_code, telegram_id, is_renewal_price, promo_payload_id = parse_nu_crypto_invoice_payload(
+        inv.get("payload")
+    )
     if not plan_code or telegram_id is None:
         print(f"crypto webhook: нет nu_plan/tg в payload счёта {invoice_id}")
         return PlainTextResponse("OK", status_code=200)
@@ -3443,6 +3723,10 @@ async def crypto_pay_webhook(request: Request):
         until = extend_user_subscription_days(telegram_id, days, plan_code=plan_code)
         if plan_code in TEAM_FIXED_TIER_CODES:
             team_apply_fixed_tier_after_payment(telegram_id, plan_code)
+
+    user_clear_promo_pending(telegram_id)
+    if promo_payload_id:
+        promo_redeem_on_payment(telegram_id, str(promo_payload_id), invoice_id)
 
     await referral_process_paid_invoice(inv, telegram_id, is_renewal_price)
 
@@ -4003,7 +4287,7 @@ async def show_user_profile_screen(query: CallbackQuery) -> None:
     chat_id = query.message.chat.id
     u = user_get(tid)
     text = build_user_profile_public_text(tid, u)
-    markup = kb_user_back_main()
+    markup = kb_user_profile()
     photo = profile_photo_for_new_message()
     if photo:
         try:
@@ -5345,6 +5629,41 @@ async def cb_user_profile_menu(query: CallbackQuery):
     await query.answer()
 
 
+@dp.callback_query(F.data == f"{UCB}:profile_promo")
+async def cb_user_profile_promo_start(query: CallbackQuery, state: FSMContext):
+    if not await require_policies_or_block(query):
+        return
+    await state.set_state(UserProfileStates.promo_wait)
+    await query.message.answer(
+        "🎫 Введите <b>промокод</b> (латиница, цифры, символ _).\n"
+        "Скидка применится к <b>следующей</b> оплате тарифа через Crypto Bot.\n\n"
+        "/cancel — отмена.",
+        parse_mode="HTML",
+    )
+    await query.answer()
+
+
+@dp.message(UserProfileStates.promo_wait, F.text)
+async def user_profile_promo_text(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    if not is_admin(uid) and not policies_user_has_accepted(uid):
+        await state.clear()
+        return
+    raw = (message.text or "").strip()
+    if raw.startswith("/"):
+        return
+    ok, msg = promo_try_apply_user_code(message.from_user.id, raw)
+    await state.clear()
+    if ok:
+        await message.answer(msg, parse_mode="HTML", reply_markup=kb_user_profile())
+    else:
+        await message.answer(
+            f"⚠️ {esc_html(msg)}",
+            parse_mode="HTML",
+            reply_markup=kb_user_profile(),
+        )
+
+
 @dp.callback_query(F.data == f"{UCB}:reviews")
 async def cb_user_reviews_placeholder(query: CallbackQuery):
     if not await require_policies_or_block(query):
@@ -5730,6 +6049,14 @@ async def cb_user_tariff_plan(query: CallbackQuery):
                     f"\n\n<i>Ранее: {tariff_plan_invoice_label(stored)}. "
                     f"Переход на {tariff_plan_invoice_label(code)} — полная стоимость.</i>"
                 )
+    u_pr = user_get(uid)
+    if u_pr and u_pr.get("promo_pending_id"):
+        prw = promo_get_by_id(str(u_pr.get("promo_pending_id")))
+        if prw and promo_row_ok_for_discounted_invoice(uid, prw):
+            sub_text += (
+                f"\n\n<i>Промокод: скидка <b>{int(prw.get('discount_percent') or 0)}%</b> "
+                "к сумме счёта в Crypto Pay.</i>"
+            )
     markup = kb_tariff_subplan_detail(code)
     plan_img = tariff_plan_photo_for_plan(code)
     chat_id = query.message.chat.id
@@ -5780,13 +6107,28 @@ async def cb_tariff_buy_crypto_pay(query: CallbackQuery):
         else user_eligible_for_renewal_price(tid, code)
     )
     amount = crypto_pay_amount_for_plan(code, renewal=renewal)
+    promo_uuid: Optional[str] = None
+    promo_pct_applied = 0
+    u_buy = user_get(tid)
+    if u_buy:
+        ppend = u_buy.get("promo_pending_id")
+        if ppend:
+            prow = promo_get_by_id(str(ppend))
+            if prow and promo_row_ok_for_discounted_invoice(tid, prow):
+                promo_pct_applied = int(prow.get("discount_percent") or 0)
+                amount = crypto_amount_apply_discount_percent(amount, promo_pct_applied)
+                promo_uuid = str(prow.get("id") or "")
     asset = CRYPTO_PAY_ASSET
     desc = (
         f"Neuro Uploader — продление {label}"
         if renewal
         else f"Neuro Uploader — подписка {label}"
     )
+    if promo_uuid and promo_pct_applied > 0:
+        desc += f" (промо −{promo_pct_applied}%)"
     payload = f"nu_plan={code};tg={tid};renew={'1' if renewal else '0'}"
+    if promo_uuid:
+        payload += f";promo={promo_uuid}"
     pay_url, err = await crypto_pay_create_invoice(
         asset=asset,
         amount=amount,
@@ -6477,6 +6819,7 @@ async def cmd_admin(message: Message, state: FSMContext):
         "• Изменение срока подписки\n"
         "• Сброс и ручная установка HWID\n"
         "• Рассылка всем пользователям из базы\n"
+        "• **Промокоды** — скидка %, срок, лимит активаций; пользователь вводит код в профиле\n"
         "• **🆔 ID кастомных эмодзи** — кнопка ниже: пришлите эмодзи, бот вернёт `custom_emoji_id`\n\n"
         "Команды: `/add ID дней`, `/reset ID`\n"
         "Файлы после оплаты: `/set_app_zip` → затем отправьте zip; `/set_app_txt` → затем txt.",
@@ -6521,7 +6864,20 @@ async def cmd_cancel(message: Message, state: FSMContext):
             reply_markup=kb_uniqueizer_hub(),
         )
         return
+    if str(current) == "UserProfileStates:promo_wait":
+        await state.clear()
+        await message.answer("Ввод промокода отменён.", reply_markup=kb_user_profile())
+        return
     if not is_admin(message.from_user.id):
+        return
+    if str(current) in (
+        "AdminStates:promo_code",
+        "AdminStates:promo_discount",
+        "AdminStates:promo_valid_until",
+        "AdminStates:promo_max_uses",
+    ):
+        await state.clear()
+        await message.answer("Создание промокода отменено.", reply_markup=kb_main_admin())
         return
     await state.clear()
     await message.answer("Отменено.", reply_markup=kb_main_admin())
@@ -6718,6 +7074,246 @@ async def cb_broadcast_run(query: CallbackQuery, state: FSMContext):
     )
 
 
+def _kb_admin_promo_list(rows: list[dict]) -> InlineKeyboardMarkup:
+    keyboard: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="➕ Создать промокод", callback_data=f"{CB}:promonew")],
+    ]
+    for row in rows[:12]:
+        pid = str(row.get("id") or "")
+        if not pid:
+            continue
+        c = str(row.get("code") or "?")[:18]
+        on = bool(row.get("is_active", True))
+        pct = int(row.get("discount_percent") or 0)
+        uu = int(row.get("uses_count") or 0)
+        mx = row.get("max_uses")
+        mx_s = "∞" if mx is None else str(int(mx))
+        label = f"{'✓' if on else '✗'} {c} {pct}% {uu}/{mx_s}"
+        row_btns = [
+            InlineKeyboardButton(text=label[:40], callback_data=f"{CB}:noop"),
+        ]
+        row_btns.append(
+            InlineKeyboardButton(
+                text="⏸" if on else "▶️",
+                callback_data=(f"{CB}:promooff:{pid}" if on else f"{CB}:promoon:{pid}"),
+            )
+        )
+        row_btns.append(InlineKeyboardButton(text="🗑", callback_data=f"{CB}:promodel:{pid}"))
+        keyboard.append(row_btns)
+    keyboard.append([InlineKeyboardButton(text="🏠 Админ-меню", callback_data=f"{CB}:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+def _admin_promo_list_html(rows: list[dict]) -> str:
+    now = int(time.time())
+    lines = ["🎫 <b>Промокоды</b>\n"]
+    if not rows:
+        lines.append("<i>Пока нет ни одного.</i>")
+        return "\n".join(lines)
+    for row in rows:
+        c = esc_html(str(row.get("code") or ""))
+        pct = int(row.get("discount_percent") or 0)
+        vu = int(row.get("valid_until") or 0)
+        vu_s = fmt_ts(vu) if vu > 0 else "—"
+        uu = int(row.get("uses_count") or 0)
+        mx = row.get("max_uses")
+        mx_s = "∞" if mx is None else str(int(mx))
+        on = bool(row.get("is_active", True))
+        st = "активен" if on else "выкл"
+        exp = "истёк" if (vu > 0 and now > vu) else "ок"
+        lines.append(
+            f"• <b>{c}</b> — <b>{pct}%</b> · до <b>{esc_html(vu_s)}</b> · активаций <b>{uu}</b>/<b>{mx_s}</b> · {st} · {exp}"
+        )
+    lines.append("\n<i>Скидка списывается при успешной оплате любого тарифа в боте (Crypto Pay).</i>")
+    return "\n".join(lines)
+
+
+@dp.callback_query(F.data == f"{CB}:promo")
+async def cb_admin_promo_menu(query: CallbackQuery, state: FSMContext):
+    if not is_admin(query.from_user.id):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    rows = promo_list_recent(30)
+    await safe_edit_text(
+        query.message,
+        _admin_promo_list_html(rows),
+        parse_mode="HTML",
+        reply_markup=_kb_admin_promo_list(rows),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == f"{CB}:promonew")
+async def cb_admin_promo_new(query: CallbackQuery, state: FSMContext):
+    if not is_admin(query.from_user.id):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    await state.set_state(AdminStates.promo_code)
+    await state.set_data({})
+    await query.message.answer(
+        "🎫 <b>Новый промокод</b> — шаг 1/4\n\n"
+        "Введите <b>код</b> (латиница, цифры, _), длина <b>3–40</b>.\n"
+        "/cancel — отмена.",
+        parse_mode="HTML",
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data.startswith(f"{CB}:promooff:"))
+async def cb_admin_promo_deactivate(query: CallbackQuery, state: FSMContext):
+    if not is_admin(query.from_user.id):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    pid = (query.data or "").split(":")[-1]
+    promo_set_active(pid, False)
+    await query.answer("Выключен")
+    rows = promo_list_recent(30)
+    await safe_edit_text(
+        query.message,
+        _admin_promo_list_html(rows),
+        parse_mode="HTML",
+        reply_markup=_kb_admin_promo_list(rows),
+    )
+
+
+@dp.callback_query(F.data.startswith(f"{CB}:promoon:"))
+async def cb_admin_promo_activate(query: CallbackQuery, state: FSMContext):
+    if not is_admin(query.from_user.id):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    pid = (query.data or "").split(":")[-1]
+    promo_set_active(pid, True)
+    await query.answer("Включён")
+    rows = promo_list_recent(30)
+    await safe_edit_text(
+        query.message,
+        _admin_promo_list_html(rows),
+        parse_mode="HTML",
+        reply_markup=_kb_admin_promo_list(rows),
+    )
+
+
+@dp.callback_query(F.data.startswith(f"{CB}:promodel:"))
+async def cb_admin_promo_delete(query: CallbackQuery, state: FSMContext):
+    if not is_admin(query.from_user.id):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    pid = (query.data or "").split(":")[-1]
+    promo_delete_row(pid)
+    await state.clear()
+    await query.answer("Удалён")
+    rows = promo_list_recent(30)
+    await safe_edit_text(
+        query.message,
+        _admin_promo_list_html(rows),
+        parse_mode="HTML",
+        reply_markup=_kb_admin_promo_list(rows),
+    )
+
+
+@dp.message(AdminStates.promo_code, F.text)
+async def admin_promo_step_code(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    if (message.text or "").strip().startswith("/"):
+        return
+    code = promo_normalize_code(message.text or "")
+    if len(code) < 3:
+        await message.answer("Код слишком короткий (минимум 3 символа после нормализации).")
+        return
+    try:
+        chk = supabase.table("promo_codes").select("id").eq("code", code).limit(1).execute()
+        if chk.data:
+            await message.answer("Такой код уже существует.")
+            return
+    except Exception as e:
+        await message.answer(f"Ошибка БД: {esc_html(str(e))}", parse_mode="HTML")
+        return
+    await state.update_data(promo_draft_code=code)
+    await state.set_state(AdminStates.promo_discount)
+    await message.answer("Шаг 2/4: скидка в <b>процентах</b> — целое число <b>1–99</b>.", parse_mode="HTML")
+
+
+@dp.message(AdminStates.promo_discount, F.text)
+async def admin_promo_step_discount(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    if (message.text or "").strip().startswith("/"):
+        return
+    try:
+        p = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("Нужно целое число 1–99.")
+        return
+    if p < 1 or p > 99:
+        await message.answer("Допустимо только 1–99.")
+        return
+    await state.update_data(promo_draft_pct=p)
+    await state.set_state(AdminStates.promo_valid_until)
+    await message.answer(
+        "Шаг 3/4: дата окончания действия (конец дня <b>UTC</b>).\n"
+        "Форматы: <code>31.12.2026</code> или <code>2026-12-31</code>.",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(AdminStates.promo_valid_until, F.text)
+async def admin_promo_step_valid_until(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    if (message.text or "").strip().startswith("/"):
+        return
+    ts = promo_parse_valid_until_date(message.text or "")
+    if ts is None:
+        await message.answer("Не удалось разобрать дату. Пример: <code>31.12.2026</code>", parse_mode="HTML")
+        return
+    await state.update_data(promo_draft_until=ts)
+    await state.set_state(AdminStates.promo_max_uses)
+    await message.answer(
+        "Шаг 4/4: сколько раз промокод может быть <b>успешно оплачен</b> (разных пользователей).\n"
+        "Введите целое число <b>≥ 1</b> или <code>0</code> / «бесконечно» для <b>без лимита</b>.",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(AdminStates.promo_max_uses, F.text)
+async def admin_promo_step_max_uses(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    if (message.text or "").strip().startswith("/"):
+        return
+    mx = promo_parse_max_uses(message.text or "")
+    if mx == -1:
+        await message.answer(
+            "Не понял. Введите число ≥ 1 или <code>0</code> / бесконечно для без лимита.",
+            parse_mode="HTML",
+        )
+        return
+    data = await state.get_data()
+    code = data.get("promo_draft_code") or ""
+    pct = int(data.get("promo_draft_pct") or 0)
+    until = int(data.get("promo_draft_until") or 0)
+    pid = promo_insert_row(code, pct, until, mx)
+    await state.clear()
+    if not pid:
+        await message.answer(
+            "Не удалось создать промокод (таблица <code>promo_codes</code>? выполните SQL из <code>promo_codes.sql</code>).",
+            parse_mode="HTML",
+            reply_markup=kb_main_admin(),
+        )
+        return
+    await message.answer(
+        f"✅ Промокод <b>{esc_html(code)}</b> создан.",
+        parse_mode="HTML",
+        reply_markup=kb_main_admin(),
+    )
+
+
 @dp.callback_query(F.data == f"{CB}:menu")
 async def cb_menu(query: CallbackQuery, state: FSMContext):
     if not is_admin(query.from_user.id):
@@ -6795,6 +7391,7 @@ async def cb_help(query: CallbackQuery):
         "• **Реф. баланс** в карточке пользователя — задать **доступную к выводу** сумму (USD).\n"
         "• **Описания тарифов** — HTML карточки STANDART/PRO/MAX/TEAM/UNIQUEIZER (цены в тексте); списание в Crypto Pay — .env.\n"
         "• **Рассылка** — одно сообщение всем из `users` (копирование: текст, фото, документ и т.д.).\n"
+        "• **Промокоды** — создать код со скидкой; пользователь активирует в профиле, скидка на оплату Crypto Pay.\n"
         "• **🆔 ID кастомных эмодзи** — пришлите кастомный эмодзи или стикер; бот вернёт `custom_emoji_id` для кода.\n\n"
         "/cancel — отменить ввод.",
         parse_mode="Markdown",
