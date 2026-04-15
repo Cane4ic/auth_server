@@ -127,6 +127,14 @@ LINK_PRIVACY = (os.environ.get("LINK_PRIVACY") or "").strip()
 LINK_PRICING = (os.environ.get("LINK_PRICING") or "").strip()
 # Чат для логов входа на сайт / в приложение (числовой id: группа или канал; бот должен быть участником)
 AUTH_LOG_CHAT_ID = (os.environ.get("AUTH_LOG_CHAT_ID") or "").strip()
+# Закрытый канал для идей («Предложить идею» в главном меню): id вида -100…; бот — админ с правом публиковать.
+_IDEAS_CH_RAW = (os.environ.get("IDEAS_CHANNEL_ID") or "").strip()
+IDEAS_CHANNEL_ID: Optional[int] = None
+if _IDEAS_CH_RAW:
+    try:
+        IDEAS_CHANNEL_ID = int(_IDEAS_CH_RAW)
+    except ValueError:
+        print(f"ВНИМАНИЕ: некорректный IDEAS_CHANNEL_ID: {_IDEAS_CH_RAW!r}")
 # Crypto Pay (@CryptoBot / тест: @CryptoTestnetBot): токен — только CRYPTO_PAY_API_TOKEN в .env, не в коде.
 # true = https://testnet-pay.crypt.bot (приложение из @CryptoTestnetBot); false = боевой pay.crypt.bot
 CRYPTO_PAY_TESTNET = (os.environ.get("CRYPTO_PAY_TESTNET") or "true").strip().lower() in (
@@ -353,6 +361,11 @@ class UniqueizerStates(StatesGroup):
     uniq_media = State()
     uniq_wait_tpl = State()
     uniq_copies = State()
+
+
+class UserIdeaStates(StatesGroup):
+    """Предложения идей: сообщения пересылаются в IDEAS_CHANNEL_ID."""
+    waiting = State()
 
 
 def is_admin(user_id: int) -> bool:
@@ -3224,7 +3237,7 @@ def kb_policies_accept():
 
 
 def kb_user_main_menu(telegram_user_id: Optional[int] = None):
-    """Главное меню: Профиль|Отзывы, Тарифы|Рефералы, Уникализатор (всегда), «Команда» — при TEAM."""
+    """Главное меню: Профиль|Отзывы, Тарифы|Рефералы, Уникализатор, «Команда», идеи (если IDEAS_CHANNEL_ID), Поддержка."""
     profile_btn = _btn_uz_icon("Профиль", f"{UCB}:profile", EMOJI_BTN_PROFILE)
     # По требованию: «Отзывы» — просто картинка, поэтому всегда открываем callback.
     reviews_btn = _btn_uz_icon("Отзывы", f"{UCB}:reviews", EMOJI_BTN_REVIEWS)
@@ -3252,6 +3265,10 @@ def kb_user_main_menu(telegram_user_id: Optional[int] = None):
     if telegram_user_id is not None:
         rows.append(
             [_btn_uz_icon("Команда", f"{UCB}:team", EMOJI_BTN_TEAM)]
+        )
+    if IDEAS_CHANNEL_ID is not None:
+        rows.append(
+            [InlineKeyboardButton(text="\U0001f4a1 Предложить идею", callback_data=f"{UCB}:idea")]
         )
     rows.append([support_btn])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -3291,6 +3308,14 @@ def kb_referrals_withdraw_cancel():
     )
 
 
+def kb_user_idea_cancel():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="\u274c Отмена", callback_data=f"{UCB}:idea_cancel")],
+        ]
+    )
+
+
 def text_tariffs_caption_html() -> str:
     if LINK_TERMS:
         agree = f'<a href="{html.escape(LINK_TERMS, quote=True)}">пользовательским соглашением</a>'
@@ -3318,12 +3343,10 @@ def text_uniqueizer_screen_html() -> str:
         return raw
     return (
         "🎯 <b>Уникализатор</b>\n\n"
-        "• <b>Уникализация</b> — сначала режим: <b>по шаблону</b> (любой из ваших на эту загрузку) "
-        "или <b>своя настройка</b> (без сохранения в базу), затем фото/видео и число копий; ответ — ZIP.\n"
-        "• <b>Шаблоны</b> — создать и хранить пресеты; ✓ — активный шаблон (удобно, если заходите сразу с медиа "
-        "без выбора режима — см. подсказки бота).\n\n"
-        "<i><b>ffmpeg</b> — пакет <code>imageio-ffmpeg</code>, опционально <code>FFMPEG_PATH</code> или бинарник в PATH. "
-        "Видео без ffmpeg не обрабатывается; фото при необходимости — через Pillow.</i>"
+        "• Уникализация — выберите режим шаблона если он настроен у вас или одноразовую уникализацию "
+        "через собственные настройки.\n"
+        "• Шаблоны — создайте шаблон который вы сможете использовать постоянно без нужды заново "
+        "настраивать уникализацию.\n"
     )
 
 
@@ -6804,6 +6827,82 @@ async def cb_user_support_placeholder(query: CallbackQuery):
     await query.answer()
 
 
+@dp.callback_query(F.data == f"{UCB}:idea")
+async def cb_user_idea_start(query: CallbackQuery, state: FSMContext):
+    if not await require_policies_or_block(query):
+        return
+    if IDEAS_CHANNEL_ID is None:
+        await query.answer("Раздел временно недоступен.", show_alert=True)
+        return
+    await state.set_state(UserIdeaStates.waiting)
+    raw_hint = (os.environ.get("TEXT_IDEA_SCREEN") or "").strip()
+    if raw_hint:
+        text = raw_hint
+        pm: Optional[str] = "HTML"
+    else:
+        text = (
+            "\U0001f4a1 <b>Предложить идею</b>\n\n"
+            "Напишите, что вы хотели бы видеть в будущих обновлениях. Каждое ваше сообщение будет "
+            "<b>переслано</b> в рабочий канал команды.\n\n"
+            "/cancel — отменить."
+        )
+        pm = "HTML"
+    await safe_edit_text(
+        query.message,
+        text,
+        parse_mode=pm,
+        reply_markup=kb_user_idea_cancel(),
+    )
+    await query.answer()
+
+
+@dp.callback_query(F.data == f"{UCB}:idea_cancel")
+async def cb_user_idea_cancel(query: CallbackQuery, state: FSMContext):
+    if not await require_policies_or_block(query):
+        return
+    await state.clear()
+    extra = "\n\n\U0001f510 /admin — панель администратора." if is_admin(query.from_user.id) else ""
+    await show_user_main_menu(
+        query.bot,
+        query.message.chat.id,
+        extra_caption=extra,
+        telegram_user_id=query.from_user.id,
+        telegram_username=query.from_user.username if query.from_user else None,
+        anchor_message=query.message,
+    )
+    await query.answer("Отменено.")
+
+
+@dp.message(UserIdeaStates.waiting)
+async def user_idea_receive(message: Message, state: FSMContext):
+    if IDEAS_CHANNEL_ID is None:
+        await state.clear()
+        return
+    uid = message.from_user.id if message.from_user else 0
+    if not is_admin(uid) and not policies_user_has_accepted(uid):
+        await state.clear()
+        return
+    if message.text and message.text.startswith("/"):
+        return
+    try:
+        await message.bot.forward_message(
+            chat_id=IDEAS_CHANNEL_ID,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+        )
+    except Exception as e:
+        print(f"IDEAS_CHANNEL forward failed: {e}")
+        await message.answer(
+            "Не удалось отправить сообщение. Попробуйте позже или обратитесь в поддержку.",
+            reply_markup=kb_user_idea_cancel(),
+        )
+        return
+    await message.answer(
+        "\u2705 Спасибо, идея принята. Можете отправить ещё одно сообщение или нажмите «Отмена».",
+        reply_markup=kb_user_idea_cancel(),
+    )
+
+
 # --- Админ: команды ---
 
 
@@ -6831,6 +6930,18 @@ async def cmd_admin(message: Message, state: FSMContext):
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
     current = await state.get_state()
+    if current == UserIdeaStates.waiting:
+        await state.clear()
+        extra = "\n\n\U0001f510 /admin — панель администратора." if is_admin(message.from_user.id) else ""
+        await show_user_main_menu(
+            message.bot,
+            message.chat.id,
+            extra_caption=extra,
+            telegram_user_id=message.from_user.id,
+            telegram_username=message.from_user.username if message.from_user else None,
+            anchor_message=None,
+        )
+        return
     if current == UserReferralWithdrawStates.amount:
         await state.clear()
         await user_shell_refresh_referrals(
