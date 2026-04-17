@@ -28,7 +28,7 @@ import uvicorn
 from aiogram import Bot, Dispatcher, F
 from aiogram.dispatcher.event.bases import UNHANDLED
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.enums import ChatMemberStatus, MessageEntityType
+from aiogram.enums import ChatAction, ChatMemberStatus, MessageEntityType
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -1464,6 +1464,9 @@ def _ffmpeg_transcode_video_copy(
     qv_mpeg = max(2, min(31, int(3 + (variant_index % 10) * (0.6 + jm * 0.5) * vd)))
     strip_meta = int(levels.get("strip_meta") or 0) > 0
     tail_meta: list[str] = ["-map_metadata", "-1"] if strip_meta else []
+    # Аудио: копируем без перекодирования (раньше был -an — дорожка выкидывалась целиком).
+    # Явный -map для a не используем: при -vf иначе можно случайно не замапить отфильтрованное видео.
+    audio_tail = ["-c:a", "copy"]
     attempts: list[list[str]] = [
         [
             ffmpeg_exe,
@@ -1483,7 +1486,7 @@ def _ffmpeg_transcode_video_copy(
             str(crf),
             "-pix_fmt",
             "yuv420p",
-            "-an",
+            *audio_tail,
             *tail_meta,
             "-movflags",
             "+faststart",
@@ -1503,7 +1506,7 @@ def _ffmpeg_transcode_video_copy(
             "mpeg4",
             "-q:v",
             str(qv_mpeg),
-            "-an",
+            *audio_tail,
             *tail_meta,
             out_path,
         ],
@@ -1601,6 +1604,20 @@ def _apply_uniqueizer_pil(im: Image.Image, levels: dict[str, int], variant: int)
         bio.seek(0)
         img = Image.open(bio).convert("RGB")
     return img
+
+
+async def _uniqueizer_upload_action_pulse(bot: Bot, chat_id: int, stop: asyncio.Event) -> None:
+    """Пока идёт тяжёлая обработка в thread — периодически показывает индикатор «отправка файла»."""
+    while not stop.is_set():
+        try:
+            await bot.send_chat_action(chat_id, ChatAction.UPLOAD_DOCUMENT)
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=4.5)
+            return
+        except asyncio.TimeoutError:
+            continue
 
 
 def _uniqueizer_process_to_zip(
@@ -5317,22 +5334,55 @@ async def cb_uniqueizer_do_copies(query: CallbackQuery, state: FSMContext):
     else:
         row = uniqueizer_template_get_row(str(tpl_id)) if tpl_id else None
         tpl_levels = _template_levels_from_row(row) if row else _uz_tpl_levels_empty()
-    await query.answer("⏳ Обрабатываю…")
+    await query.answer("⏳ Уникализация…")
+    kind = "видео" if is_vid else "фото"
+    progress_html = (
+        "⏳ <b>Уникализация выполняется</b>\n\n"
+        f"Готовлю <b>{n}</b> копий ({kind}). Подождите — для видео это может занять несколько минут.\n"
+        "<i>Сообщение обновится, когда архив будет готов.</i>"
+    )
+    empty_kb = InlineKeyboardMarkup(inline_keyboard=[])
+    await safe_edit_text(
+        query.message,
+        progress_html,
+        parse_mode="HTML",
+        reply_markup=empty_kb,
+    )
+    progress_stop = asyncio.Event()
+    pulse_task = asyncio.create_task(
+        _uniqueizer_upload_action_pulse(query.bot, query.message.chat.id, progress_stop)
+    )
+    zip_p: Optional[str] = None
+    err = ""
     try:
-        zip_p, err = await asyncio.to_thread(
-            _uniqueizer_process_to_zip,
-            mpath,
-            is_video=is_vid,
-            template_levels=tpl_levels,
-            copies=n,
-        )
+        try:
+            zip_p, err = await asyncio.to_thread(
+                _uniqueizer_process_to_zip,
+                mpath,
+                is_video=is_vid,
+                template_levels=tpl_levels,
+                copies=n,
+            )
+        finally:
+            progress_stop.set()
+            try:
+                await pulse_task
+            except Exception:
+                pass
         if err or not zip_p:
-            await query.message.answer(
-                f"⚠️ {esc_html(err or 'ошибка')}",
+            await safe_edit_text(
+                query.message,
+                "⚠️ <b>Уникализация не завершена</b>\n\n" + esc_html(err or "ошибка")[:3500],
                 parse_mode="HTML",
-                reply_markup=kb_uniqueizer_hub(),
+                reply_markup=empty_kb,
             )
         else:
+            await safe_edit_text(
+                query.message,
+                f"✅ <b>Готово.</b> Сформировано <b>{n}</b> копий — отправляю архив…",
+                parse_mode="HTML",
+                reply_markup=empty_kb,
+            )
             try:
                 await query.message.answer_document(
                     FSInputFile(zip_p, filename="unique_pack.zip"),
