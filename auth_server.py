@@ -3,6 +3,7 @@
 API для приложения + админ-панель в Telegram (ADMIN_ID — один или несколько id через запятую).
 """
 import asyncio
+import colorsys
 import html
 import io
 import json
@@ -50,7 +51,7 @@ from pydantic import BaseModel
 from supabase import Client, create_client
 
 try:
-    from PIL import Image, ImageEnhance, ImageOps
+    from PIL import Image, ImageDraw, ImageEnhance, ImageOps
 
     HAS_PIL = True
 except ImportError:
@@ -875,9 +876,16 @@ UNIQUEIZER_OPTION_DEFS: tuple[tuple[str, str], ...] = (
     ("brightness", "Яркость"),
     ("contrast", "Контраст"),
     ("saturation", "Насыщенность"),
+    ("hue_shift", "Оттенок (Hue)"),
     ("sharpen", "Резкость"),
     ("resize_pct", "Масштаб ±%"),
     ("noise", "Лёгкий шум"),
+    ("pixel_shift", "Сдвиг пикселей"),
+    ("invis_overlay", "Невидимый оверлей"),
+    ("fps_convert", "FPS (целевой)"),
+    ("micro_speed", "Микро-скорость ±%"),
+    ("invis_frame", "Невидимый кадр"),
+    ("bitrate_jitter", "Битрейт (разброс)"),
     ("jpeg_q", "JPEG-качество"),
     ("strip_meta", "Убрать EXIF/мета"),
 )
@@ -1250,6 +1258,118 @@ def kb_uniqueizer_copies_pick() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _uz_video_micro_speed_factor(levels: dict[str, int], variant: int, rng: random.Random) -> float:
+    """±1–2% длительности/скорости; >1 — быстрее (короче), <1 — медленнее."""
+    lv = int(levels.get("micro_speed") or 0)
+    m = _uz_effect_mult(lv)
+    if m <= 0:
+        return 1.0
+    vd = UNIQUEIZER_VARIANT_DAMPEN
+    cap = 0.01 + 0.01 * min(3, lv) / 3.0
+    delta = (rng.uniform(0.004, 0.012) * m * vd + (variant % 5) * 0.0014 * m * vd) * (1.0 + 0.35 * (lv - 1))
+    delta = min(cap * 1.8, max(0.003, delta))
+    if rng.random() < 0.5:
+        return 1.0 + delta
+    return max(0.985, 1.0 - delta)
+
+
+def _uz_fps_filter_expr(levels: dict[str, int], variant: int, rng: random.Random) -> Optional[str]:
+    """Выражение для фильтра fps=… (только видео)."""
+    lv = int(levels.get("fps_convert") or 0)
+    m = _uz_effect_mult(lv)
+    if m <= 0:
+        return None
+    vd = UNIQUEIZER_VARIANT_DAMPEN
+    pool = ["24000/1001", "24", "25", "30000/1001", "30", "31"]
+    if lv <= 1:
+        sub = ["24", "25", "30000/1001", "30"]
+    elif lv == 2:
+        sub = pool
+    else:
+        sub = pool + ["15", "48", "60000/1001"]
+    pick = rng.choice(sub)
+    if rng.random() < 0.25 * vd * m and lv >= 2:
+        pick = pool[(variant + int(rng.random() * 5)) % len(pool)]
+    return pick
+
+
+def _uz_append_pixel_shift_vf(
+    parts: list[str], levels: dict[str, int], variant: int, rng: random.Random, vd: float
+) -> None:
+    m = _uz_effect_mult(levels.get("pixel_shift", 0))
+    if m <= 0:
+        return
+    mag = max(1, min(3, int(round(1 + 2 * m + (variant % 3) * 0.35 * vd))))
+    sx = rng.choice([-mag, 0, mag])
+    sy = rng.choice([-mag, 0, mag])
+    if sx == 0 and sy == 0:
+        sx = mag if (variant % 2) == 0 else -mag
+    if sx > 0:
+        parts.append(f"pad=iw+{sx}:ih:{sx}:0:black")
+        parts.append("crop=iw:ih:0:0")
+    elif sx < 0:
+        px = -sx
+        parts.append(f"pad=iw+{px}:ih:0:0:black")
+        parts.append(f"crop=iw:ih:{px}:0")
+    if sy > 0:
+        parts.append(f"pad=iw:ih+{sy}:0:{sy}:black")
+        parts.append("crop=iw:ih:0:0")
+    elif sy < 0:
+        py = -sy
+        parts.append(f"pad=iw:ih+{py}:0:0:black")
+        parts.append(f"crop=iw:ih:0:{py}")
+
+
+def _uz_append_hue_shift_vf(
+    parts: list[str], levels: dict[str, int], variant: int, rng: random.Random, vd: float
+) -> None:
+    mh = _uz_effect_mult(levels.get("hue_shift", 0))
+    if mh <= 0:
+        return
+    hue_deg = (rng.uniform(-22, 22) + (variant % 9 - 4) * 6.5) * mh * vd
+    parts.append(f"hue=h={hue_deg}*PI/180:s=1")
+
+
+def _uz_append_invis_overlay_vf(
+    parts: list[str], levels: dict[str, int], variant: int, rng: random.Random, vd: float
+) -> None:
+    m = _uz_effect_mult(levels.get("invis_overlay", 0))
+    if m <= 0:
+        return
+    n_dust = max(1, int(2 + m * 7 * vd))
+    parts.append(f"noise=alls={n_dust}:allf=t+u:all_seed={variant * 7919 % 1000007}")
+    ph = rng.random() * 9.0
+    amp = 0.35 + 1.65 * m * vd
+    fx = 0.055 + rng.random() * 0.04 * m
+    fy = 0.038 + rng.random() * 0.03 * m
+    parts.append(
+        f"geq=lum='lum(X,Y)+{amp:.4f}*sin({fx:.5f}*X+{fy:.5f}*Y+{ph:.4f}+T)':"
+        f"cb='cb(X,Y)':cr='cr(X,Y)'"
+    )
+
+
+def _uz_append_invis_frame_vf(
+    parts: list[str], levels: dict[str, int], variant: int, rng: random.Random, vd: float
+) -> None:
+    """Один «невидимый» кадр по периоду: лёгкая подмена яркости (структура потока)."""
+    m = _uz_effect_mult(levels.get("invis_frame", 0))
+    if m <= 0:
+        return
+    span = int(56 + rng.randint(0, 90) * (0.55 + m) + (variant % 19) * int(4 * vd))
+    p = max(36, min(320, span))
+    off = variant % max(1, p - 1)
+    kind = rng.randint(0, 2)
+    if kind == 0:
+        lam = "lum(X,Y)*0.91+16*0.09"
+    elif kind == 1:
+        lam = "if(gt(lum(X,Y)*21/20\\,235)\\,235\\,lum(X,Y)*21/20)"
+    else:
+        lam = "lum(X,Y)*0.97+128*0.03"
+    parts.append(
+        f"geq=lum='if(eq(mod(N+{off}\\,{p})\\,0)\\,{lam}\\,lum(X,Y))':cb='cb(X,Y)':cr='cr(X,Y)'"
+    )
+
+
 def _ffmpeg_bin() -> Optional[str]:
     """Порядок: FFMPEG_PATH → ffmpeg в PATH → бинарник из пакета imageio-ffmpeg (pip)."""
     if FFMPEG_PATH:
@@ -1311,11 +1431,7 @@ def _ffmpeg_vf_for_uniqueize_image(levels: dict[str, int], variant: int, rng: ra
         sat += (rng.uniform(-0.32, 0.35) + (variant % 4) * 0.025 * vd) * ms
     if abs(br) > 1e-6 or abs(ctr - 1.0) > 1e-6 or abs(sat - 1.0) > 1e-6:
         parts.append(f"eq=brightness={br:.5f}:contrast={ctr:.5f}:saturation={sat:.5f}")
-    if ms > 0:
-        hue_amp = 25 + 55 * ms
-        hue = (((variant * 23) % int(2 * hue_amp) - hue_amp) * vd) + rng.uniform(-10.0, 10.0) * ms * vd
-        sat_h = 0.85 + 0.22 * ms + (variant % 5) * 0.04 * ms * vd
-        parts.append(f"hue=h={hue}*PI/180:s={sat_h:.4f}")
+    _uz_append_hue_shift_vf(parts, levels, variant, rng, vd)
     m_sh = _uz_effect_mult(levels.get("sharpen", 0))
     if m_sh > 0:
         lx = 0.35 + variant * 0.05 * m_sh * vd
@@ -1336,6 +1452,8 @@ def _ffmpeg_vf_for_uniqueize_image(levels: dict[str, int], variant: int, rng: ra
         parts.append(f"gblur=sigma={sig:.3f}")
         vang = (0.4 + (variant % 7) * 0.1 * vd) * m_rot
         parts.append(f"vignette={vang:.4f}")
+    _uz_append_pixel_shift_vf(parts, levels, variant, rng, vd)
+    _uz_append_invis_overlay_vf(parts, levels, variant, rng, vd)
     if not parts:
         mb2 = max(mb, 0.35)
         parts.append(
@@ -1388,14 +1506,19 @@ def _uniqueizer_path_looks_like_video(media_path: str) -> bool:
     return os.path.splitext(media_path)[1].lower() in _UNIQUEIZER_VIDEO_EXTS
 
 
-def _ffmpeg_vf_for_uniqueize_video(levels: dict[str, int], variant: int, rng: random.Random) -> str:
-    """Цепочка фильтров для видео (те же опции шаблона, что и для фото)."""
+def _ffmpeg_vf_for_uniqueize_video(
+    levels: dict[str, int], variant: int, rng: random.Random
+) -> tuple[str, float]:
+    """Цепочка фильтров для видео; второй элемент — множитель микро-скорости для atempo (= setpts)."""
     vd = UNIQUEIZER_VARIANT_DAMPEN
     parts: list[str] = []
     if _uz_flip_h_on(levels.get("flip_h", 0), variant):
         parts.append("hflip")
     if _uz_flip_v_on(levels.get("flip_v", 0), variant):
         parts.append("vflip")
+    spd = _uz_video_micro_speed_factor(levels, variant, rng)
+    if abs(spd - 1.0) > 1e-6:
+        parts.append(f"setpts=PTS/{spd:.6f}")
     br, ctr, sat = 0.0, 1.0, 1.0
     mb = _uz_effect_mult(levels.get("brightness", 0))
     mc = _uz_effect_mult(levels.get("contrast", 0))
@@ -1408,14 +1531,7 @@ def _ffmpeg_vf_for_uniqueize_video(levels: dict[str, int], variant: int, rng: ra
         sat += (rng.uniform(-0.28, 0.32) + (variant % 4) * 0.022 * vd) * ms
     if abs(br) > 1e-6 or abs(ctr - 1.0) > 1e-6 or abs(sat - 1.0) > 1e-6:
         parts.append(f"eq=brightness={br:.5f}:contrast={ctr:.5f}:saturation={sat:.5f}")
-    if ms > 0:
-        hue_amp = 22 + 48 * ms
-        hue = (((variant * 19) % int(2 * hue_amp) - hue_amp) * vd) + rng.uniform(-9.0, 9.0) * ms * vd
-        sat_h = 0.88 + 0.2 * ms + (variant % 5) * 0.035 * ms * vd
-        parts.append(f"hue=h={hue}*PI/180:s={sat_h:.4f}")
-    elif mb > 0 or mc > 0:
-        hue = int((variant * 13) % 40 - 20) * vd
-        parts.append(f"hue=h={hue}*PI/180:s=1.0")
+    _uz_append_hue_shift_vf(parts, levels, variant, rng, vd)
     m_sh = _uz_effect_mult(levels.get("sharpen", 0))
     if m_sh > 0:
         lx = 0.3 + variant * 0.045 * m_sh * vd
@@ -1436,10 +1552,16 @@ def _ffmpeg_vf_for_uniqueize_video(levels: dict[str, int], variant: int, rng: ra
         parts.append(f"gblur=sigma={sig:.3f}")
         vang = (0.35 + (variant % 6) * 0.085 * vd) * m_rot
         parts.append(f"vignette={vang:.4f}")
+    _uz_append_pixel_shift_vf(parts, levels, variant, rng, vd)
+    _uz_append_invis_frame_vf(parts, levels, variant, rng, vd)
+    _uz_append_invis_overlay_vf(parts, levels, variant, rng, vd)
+    fps_x = _uz_fps_filter_expr(levels, variant, rng)
+    if fps_x:
+        parts.append(f"fps={fps_x}")
     if not parts:
         hue = int(((variant * 17) % 50) - 25) * vd
         parts.append(f"hue=h={hue}*PI/180:s={0.92 + (variant % 5) * 0.035 * vd:.4f}")
-    return ",".join(parts)
+    return ",".join(parts), spd
 
 
 def _ffmpeg_transcode_video_copy(
@@ -1454,7 +1576,7 @@ def _ffmpeg_transcode_video_copy(
     levels — уже effective (см. _uniqueizer_effective_levels).
     """
     rng = random.Random(_uniqueizer_rng_seed(levels, variant_index))
-    vf = _ffmpeg_vf_for_uniqueize_video(levels, variant_index, rng)
+    vf, spd = _ffmpeg_vf_for_uniqueize_video(levels, variant_index, rng)
     jq = int(levels.get("jpeg_q", 0) or 0)
     jm = _uz_effect_mult(jq)
     vd = UNIQUEIZER_VARIANT_DAMPEN
@@ -1464,9 +1586,20 @@ def _ffmpeg_transcode_video_copy(
     qv_mpeg = max(2, min(31, int(3 + (variant_index % 10) * (0.6 + jm * 0.5) * vd)))
     strip_meta = int(levels.get("strip_meta") or 0) > 0
     tail_meta: list[str] = ["-map_metadata", "-1"] if strip_meta else []
+    br_j = _uz_effect_mult(int(levels.get("bitrate_jitter") or 0))
+    vbv_x264: list[str] = []
+    if br_j > 0:
+        base_k = 1500 + (variant_index * 61 % 800)
+        wobble = int(rng.uniform(90, 380) * br_j * vd)
+        max_k = max(850, min(6200, base_k + wobble * rng.choice([-1, 1])))
+        buf_k = max(1400, int(max_k * (1.8 + rng.random() * 0.6)))
+        vbv_x264 = ["-maxrate", f"{max_k}k", "-bufsize", f"{buf_k}k"]
     # Аудио: копируем без перекодирования (раньше был -an — дорожка выкидывалась целиком).
-    # Явный -map для a не используем: при -vf иначе можно случайно не замапить отфильтрованное видео.
-    audio_tail = ["-c:a", "copy"]
+    # При микро-скорости — atempo под тот же множитель, что setpts в -vf.
+    if abs(spd - 1.0) > 1e-6:
+        audio_tail = ["-af", f"atempo={spd:.6f}", "-c:a", "aac", "-b:a", "128k"]
+    else:
+        audio_tail = ["-c:a", "copy"]
     attempts: list[list[str]] = [
         [
             ffmpeg_exe,
@@ -1484,6 +1617,7 @@ def _ffmpeg_transcode_video_copy(
             "veryfast",
             "-crf",
             str(crf),
+            *vbv_x264,
             "-pix_fmt",
             "yuv420p",
             *audio_tail,
@@ -1563,6 +1697,26 @@ def _apply_uniqueizer_pil(im: Image.Image, levels: dict[str, int], variant: int)
     if ms > 0:
         f = 1.0 + rng.uniform(-0.14, 0.14) * ms
         img = ImageEnhance.Color(img).enhance(f)
+    mh = _uz_effect_mult(levels.get("hue_shift", 0))
+    if mh > 0:
+        deg = (rng.uniform(-16, 16) + (variant % 7 - 3) * 4.5) * mh * vd
+        dh = deg / 360.0
+        pix = list(img.getdata())
+        out_pix: list[tuple[int, int, int]] = []
+        for (r, g, b) in pix:
+            h0, s0, v0 = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+            h1 = (h0 + dh) % 1.0
+            r2, g2, b2 = colorsys.hsv_to_rgb(h1, s0, v0)
+            out_pix.append(
+                (
+                    max(0, min(255, int(r2 * 255))),
+                    max(0, min(255, int(g2 * 255))),
+                    max(0, min(255, int(b2 * 255))),
+                )
+            )
+        tmp = Image.new("RGB", img.size)
+        tmp.putdata(out_pix)
+        img = tmp
     m_sh = _uz_effect_mult(levels.get("sharpen", 0))
     if m_sh > 0:
         f = 1.0 + rng.uniform(0.05, 0.35) * m_sh
@@ -1591,6 +1745,50 @@ def _apply_uniqueizer_pil(im: Image.Image, levels: dict[str, int], variant: int)
                 max(0, min(255, g + d)),
                 max(0, min(255, b + d)),
             )
+    mp = _uz_effect_mult(levels.get("pixel_shift", 0))
+    if mp > 0:
+        mag = max(1, min(3, int(round(1 + 2 * mp + (variant % 3) * 0.35 * vd))))
+        sx = rng.choice([-mag, 0, mag])
+        sy = rng.choice([-mag, 0, mag])
+        if sx == 0 and sy == 0:
+            sx = mag if (variant % 2) == 0 else -mag
+        w, h = img.size
+        if sx > 0:
+            cnv = Image.new("RGB", (w + sx, h), (0, 0, 0))
+            cnv.paste(img, (sx, 0))
+            img = cnv.crop((0, 0, w, h))
+        elif sx < 0:
+            px = -sx
+            cnv = Image.new("RGB", (w + px, h), (0, 0, 0))
+            cnv.paste(img, (0, 0))
+            img = cnv.crop((px, 0, w, h))
+        if sy > 0:
+            cnv = Image.new("RGB", (w, h + sy), (0, 0, 0))
+            cnv.paste(img, (0, sy))
+            img = cnv.crop((0, 0, w, h))
+        elif sy < 0:
+            py = -sy
+            cnv = Image.new("RGB", (w, h + py), (0, 0, 0))
+            cnv.paste(img, (0, 0))
+            img = cnv.crop((0, py, w, h))
+    mo = _uz_effect_mult(levels.get("invis_overlay", 0))
+    if mo > 0:
+        w, h = img.size
+        step = max(18, min(w, h) // 24)
+        ov = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        dr = ImageDraw.Draw(ov)
+        a = int(3 + mo * 12 * vd + rng.random() * 6)
+        fill_ln = (255, 255, 255, min(36, a + 6))
+        for x in range(0, w, step):
+            dr.line((x, 0, x, h), fill=fill_ln, width=1)
+        for y in range(0, h, step):
+            dr.line((0, y, w, y), fill=fill_ln, width=1)
+        n_dust = max(300, int(w * h * 0.00025 * (0.4 + mo)))
+        for _ in range(n_dust):
+            x, y = rng.randint(0, w - 1), rng.randint(0, h - 1)
+            dr.point((x, y), fill=(245, 245, 245, min(32, a + 10)))
+        base_rgba = img.convert("RGBA")
+        img = Image.alpha_composite(base_rgba, ov).convert("RGB")
     jq = _uz_effect_mult(levels.get("jpeg_q", 0))
     if jq > 0:
         spread = int(10 + 14 * jq)
