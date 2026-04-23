@@ -333,6 +333,7 @@ class AdminStates(StatesGroup):
     promo_discount = State()
     promo_valid_until = State()
     promo_max_uses = State()
+    url_uniqueize_wait = State()
 
 
 class UserProfileStates(StatesGroup):
@@ -1389,6 +1390,128 @@ def _ffmpeg_bin() -> Optional[str]:
         except Exception as e:
             print(f"imageio_ffmpeg.get_ffmpeg_exe: {e}")
     return None
+
+
+def _yt_dlp_bin() -> Optional[str]:
+    return shutil.which("yt-dlp")
+
+
+def _admin_url_uniqueize_metadata(rng: random.Random) -> dict[str, str]:
+    return {
+        "title": f"clip_{uuid.uuid4().hex[:10]}",
+        "comment": f"n{rng.randint(100000, 999999)}",
+        "artist": f"user_{rng.randint(1000, 9999)}",
+        "encoder": f"ffmpeg-{rng.randint(4, 8)}.{rng.randint(0, 9)}",
+    }
+
+
+def _admin_url_uniqueize_video(source_url: str) -> tuple[Optional[str], str]:
+    """
+    URL -> yt-dlp (best quality) -> ffmpeg uniqueize -> готовый mp4.
+    Возвращает (path, ""), либо (None, "ошибка").
+    """
+    url = (source_url or "").strip()
+    if not re.match(r"^https?://", url, flags=re.IGNORECASE):
+        return None, "Нужна корректная ссылка вида http(s)://…"
+    ffmpeg_exe = _ffmpeg_bin()
+    if not ffmpeg_exe:
+        return None, "ffmpeg не найден в окружении сервера."
+    ytdlp_exe = _yt_dlp_bin()
+    if not ytdlp_exe:
+        return None, "yt-dlp не найден в PATH сервера."
+
+    work = tempfile.mkdtemp(prefix="adm_uz_url_")
+    try:
+        dl_tmpl = os.path.join(work, "src.%(ext)s")
+        dl_cmd = [
+            ytdlp_exe,
+            "--no-playlist",
+            "--no-warnings",
+            "--restrict-filenames",
+            "-f",
+            "bv*+ba/b",
+            "--merge-output-format",
+            "mp4",
+            "-o",
+            dl_tmpl,
+            url,
+        ]
+        dl = subprocess.run(dl_cmd, capture_output=True, timeout=900)
+        if dl.returncode != 0:
+            err = (dl.stderr or b"").decode(errors="replace").strip()
+            shutil.rmtree(work, ignore_errors=True)
+            return None, f"yt-dlp ошибка: {(err or f'код {dl.returncode}')[:1200]}"
+
+        src_path: Optional[str] = None
+        for nm in os.listdir(work):
+            if nm.startswith("src.") and not nm.endswith(".part"):
+                p = os.path.join(work, nm)
+                if os.path.isfile(p) and os.path.getsize(p) > 0:
+                    src_path = p
+                    break
+        if not src_path:
+            shutil.rmtree(work, ignore_errors=True)
+            return None, "Не удалось найти скачанный файл после yt-dlp."
+
+        rng = random.Random(int(time.time() * 1000) ^ (hash(url) % 10_000_019))
+        zoom = 1.01 + rng.random() * 0.01
+        speed = 1.05
+        contrast = 1.0 + rng.uniform(-0.05, 0.05)
+        saturation = 1.0 + rng.uniform(-0.05, 0.05)
+        crf = rng.randint(19, 24)
+        vf = (
+            f"scale=iw*{zoom:.5f}:ih*{zoom:.5f},"
+            f"crop=iw/{zoom:.5f}:ih/{zoom:.5f},"
+            f"setpts=PTS/{speed:.5f},"
+            f"eq=contrast={contrast:.5f}:saturation={saturation:.5f}"
+        )
+        out_path = os.path.join(work, "ready.mp4")
+        meta_args: list[str] = []
+        for k, v in _admin_url_uniqueize_metadata(rng).items():
+            meta_args.extend(["-metadata", f"{k}={v}"])
+        ff_cmd = [
+            ffmpeg_exe,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            src_path,
+            "-vf",
+            vf,
+            "-af",
+            f"atempo={speed:.5f}",
+            "-map_metadata",
+            "-1",
+            *meta_args,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            str(crf),
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-movflags",
+            "+faststart",
+            out_path,
+        ]
+        ff = subprocess.run(ff_cmd, capture_output=True, timeout=900)
+        if ff.returncode != 0 or not os.path.isfile(out_path) or os.path.getsize(out_path) <= 0:
+            err = (ff.stderr or b"").decode(errors="replace").strip()
+            shutil.rmtree(work, ignore_errors=True)
+            return None, f"ffmpeg ошибка: {(err or f'код {ff.returncode}')[:1200]}"
+        return out_path, ""
+    except subprocess.TimeoutExpired:
+        shutil.rmtree(work, ignore_errors=True)
+        return None, "Превышено время обработки (15 минут)."
+    except Exception as e:
+        shutil.rmtree(work, ignore_errors=True)
+        return None, f"Ошибка обработки URL: {e}"
 
 
 def _uz_flip_h_on(level: int, variant: int) -> bool:
@@ -3278,6 +3401,7 @@ def kb_main_admin():
         inline_keyboard=[
             [InlineKeyboardButton(text="📋 Все пользователи", callback_data=f"{CB}:list:0")],
             [InlineKeyboardButton(text="🔍 Найти по Telegram ID", callback_data=f"{CB}:usid")],
+            [InlineKeyboardButton(text="🎬 URL → Уникализация видео", callback_data=f"{CB}:urluni")],
             [InlineKeyboardButton(text="🎫 Промокоды", callback_data=f"{CB}:promo")],
             [InlineKeyboardButton(text="💳 Описания тарифов", callback_data=f"{CB}:tpl")],
             [InlineKeyboardButton(text="🎁 Реферальный %", callback_data=f"{CB}:refpct")],
@@ -7165,6 +7289,7 @@ async def cmd_admin(message: Message, state: FSMContext):
         "• Просмотр пользователей и подписок; поиск по Telegram ID\n"
         "• Изменение срока подписки\n"
         "• Сброс и ручная установка HWID\n"
+        "• URL → скачать best quality (yt-dlp) и уникализировать видео (ffmpeg)\n"
         "• Рассылка всем пользователям из базы\n"
         "• **Промокоды** — скидка %, срок, лимит активаций; пользователь вводит код в профиле\n"
         "• **🆔 ID кастомных эмодзи** — кнопка ниже: пришлите эмодзи, бот вернёт `custom_emoji_id`\n\n"
@@ -7237,6 +7362,10 @@ async def cmd_cancel(message: Message, state: FSMContext):
     ):
         await state.clear()
         await message.answer("Создание промокода отменено.", reply_markup=kb_main_admin())
+        return
+    if str(current) == "AdminStates:url_uniqueize_wait":
+        await state.clear()
+        await message.answer("URL-уникализация отменена.", reply_markup=kb_main_admin())
         return
     await state.clear()
     await message.answer("Отменено.", reply_markup=kb_main_admin())
@@ -7708,6 +7837,76 @@ async def cb_admin_custom_emoji_mode(query: CallbackQuery, state: FSMContext):
     await query.answer()
 
 
+@dp.callback_query(F.data == f"{CB}:urluni")
+async def cb_admin_url_uniqueizer(query: CallbackQuery, state: FSMContext):
+    if not is_admin(query.from_user.id):
+        await query.answer("⛔", show_alert=True)
+        return
+    await state.set_state(AdminStates.url_uniqueize_wait)
+    await safe_edit_text(
+        query.message,
+        "🎬 <b>URL → Уникализация видео</b>\n\n"
+        "Пришлите ссылку на видео (http/https).\n\n"
+        "Что сделает бот:\n"
+        "• скачает ролик через <code>yt-dlp</code> в лучшем доступном качестве;\n"
+        "• применит ffmpeg-обработку: микро-зум, скорость 1.05x, лёгкая цветокоррекция;\n"
+        "• очистит исходные метаданные и запишет новые случайные;\n"
+        "• отправит готовый файл в этот чат;\n"
+        "• удалит временные файлы.\n\n"
+        "<code>/cancel</code> или «Админ-меню» — выход.",
+        parse_mode="HTML",
+        reply_markup=kb_admin_emoji_id_back(),
+    )
+    await query.answer()
+
+
+@dp.message(AdminStates.url_uniqueize_wait, F.text)
+async def admin_url_uniqueize_run(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.clear()
+        return
+    url = (message.text or "").strip()
+    if not re.match(r"^https?://", url, flags=re.IGNORECASE):
+        await message.answer("Нужна ссылка вида http(s)://…\n/cancel — отмена.")
+        return
+    await message.answer("⏳ Скачиваю и обрабатываю видео. Это может занять до 1-2 минут…")
+    stop = asyncio.Event()
+    pulse = asyncio.create_task(_uniqueizer_upload_action_pulse(message.bot, message.chat.id, stop))
+    out_path: Optional[str] = None
+    try:
+        out_path, err = await asyncio.to_thread(_admin_url_uniqueize_video, url)
+    finally:
+        stop.set()
+        try:
+            await pulse
+        except Exception:
+            pass
+    if not out_path:
+        await message.answer(
+            "⚠️ Обработка не удалась.\n\n"
+            + esc_html(err or "Неизвестная ошибка.")
+            + "\n\nПришлите другую ссылку или /cancel.",
+            parse_mode="HTML",
+        )
+        return
+    try:
+        sz = os.path.getsize(out_path)
+        fn = f"unique_{int(time.time())}.mp4"
+        await message.answer_document(
+            document=FSInputFile(out_path, filename=fn),
+            caption=f"✅ Готово.\nРазмер: <b>{sz // (1024 * 1024)} МБ</b>\n\nМожно прислать следующую ссылку.",
+            parse_mode="HTML",
+        )
+    finally:
+        work = os.path.dirname(out_path)
+        shutil.rmtree(work, ignore_errors=True)
+
+
+@dp.message(AdminStates.url_uniqueize_wait)
+async def admin_url_uniqueize_non_text(message: Message):
+    await message.answer("Пришлите текстом ссылку http(s)://…\n/cancel — отмена.")
+
+
 @dp.message(AdminStates.custom_emoji_wait)
 async def admin_custom_emoji_collect(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -7750,6 +7949,7 @@ async def cb_help(query: CallbackQuery):
         "• **Реф. баланс** в карточке пользователя — задать **доступную к выводу** сумму (USD).\n"
         "• **Описания тарифов** — HTML карточки STANDART/PRO/MAX/TEAM/UNIQUEIZER (цены в тексте); списание в Crypto Pay — .env.\n"
         "• **Рассылка** — одно сообщение всем из `users` (копирование: текст, фото, документ и т.д.).\n"
+        "• **URL → Уникализация видео** — админ присылает ссылку, бот качает через `yt-dlp`, обрабатывает и отправляет файл обратно.\n"
         "• **Промокоды** — создать код со скидкой; пользователь активирует в профиле, скидка на оплату Crypto Pay.\n"
         "• **🆔 ID кастомных эмодзи** — пришлите кастомный эмодзи или стикер; бот вернёт `custom_emoji_id` для кода.\n\n"
         "/cancel — отменить ввод.",
